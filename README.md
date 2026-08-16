@@ -10,6 +10,7 @@ python3 ~/.claude/statusline.py install
 ```
 
 - `install` points `statusLine` and `subagentStatusLine` in `~/.claude/settings.json` at the file. 
+- `install PATH` targets another settings file instead - e.g. `project/.claude/settings.local.json`.
 - `install --no-update` disables background updates.
 
 ## Configure
@@ -20,8 +21,7 @@ python3 ~/.claude/statusline.py off cost     # hide a segment
 python3 ~/.claude/statusline.py on cost
 ```
 
-- Overrides are stored sparsely in `~/.claude/statusline.json` — only deviations from the defaults. 
-- Set `$CLAUDE_STATUSLINE_CONFIG` to keep the file elsewhere.
+- See `~/.claude/statusline.json`, configure with `$CLAUDE_STATUSLINE_CONFIG` 
 
 ## Updating
 
@@ -31,6 +31,6 @@ python3 ~/.claude/statusline.py on cost
 
 ## Developing
 
-Clone the repo and run `install` from the checkout — the working tree is then authoritative. Publish with `git push`; installed machines converge within an hour of their next render.
+Clone the repo and run `install` from the checkout — the working tree is then authoritative. Publish with `git push`.
 
 The branch glyph is Powerline (U+E0A0); use a Powerline-capable font.

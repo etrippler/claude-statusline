@@ -361,20 +361,22 @@ usage: statusline.py [command]     (no command: render the main line; JSON on st
   toggles       list toggles: the segments, plus 'update' (the hourly background check)
   on|off KEY    flip a toggle persistently
   update        fetch the latest version now (works even with 'update' toggled off)
-  install       point ~/.claude/settings.json at this file (--no-update: also 'off update')
+  install [SETTINGS]   point a settings.json at this file — default ~/.claude/settings.json,
+                       or a project's .claude/settings.json (--no-update: also 'off update')
 
 segments: {' '.join(SEGMENTS)}
 config:   {CONF} — set $CLAUDE_STATUSLINE_CONFIG to relocate
 """
 
-def install(no_update=False):
-    settings = CLAUDE / "settings.json"
+def install(no_update=False, target=None):
+    settings = Path(target).expanduser() if target else CLAUDE / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
     s = jread(settings)
     cmd = "python3 " + str(SELF).replace(str(Path.home()), "~", 1)
     s["statusLine"] = {"type": "command", "command": cmd, "padding": 0, "refreshInterval": 10}
     s["subagentStatusLine"] = {"type": "command", "command": cmd + " subagent"}
     settings.write_text(json.dumps(s, indent=2) + "\n")
-    print(f"settings.json statusLine + subagentStatusLine → {cmd}"
+    print(f"{settings} statusLine + subagentStatusLine → {cmd}"
           + ("\n(running from a git checkout: auto-update stays off; publish with git)" if in_checkout() else ""))
     if no_update: cmd_toggle("update", False)
 
@@ -383,7 +385,9 @@ def main():
     cmd = a[0] if a else ""
     if cmd in ("-h", "--help", "help"): return print(USAGE, end="")
     if cmd == "update": return cmd_update()
-    if cmd == "install": return install("--no-update" in a)
+    if cmd == "install":
+        rest = [x for x in a[1:] if x != "--no-update"]
+        return install("--no-update" in a, rest[0] if rest else None)
     if cmd == "toggles": return cmd_toggles()
     if cmd in ("on", "off"):
         if len(a) < 2: sys.exit("usage: statusline.py on|off SEG")
