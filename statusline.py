@@ -321,14 +321,29 @@ def build_row(t, fallback, cols, now):
     pad = cols - len(left) - len(right) if cols else 0
     return dim(left + " " * pad + right if right and pad > 0 else sep.join(x for x in (left, right) if x))
 
+def session_effort(model_id, project):
+    # Claude Code omits a task's effort when it inherits the session's, so rebuild
+    # that from the settings cascade the way it does: merge user < project < local
+    # per key, then modelSettings[model] over the plain effortLevel. A mid-session
+    # /effort change lives only in memory and can't be recovered here.
+    merged, models = {}, {}
+    for p in (CLAUDE / "settings.json", project / ".claude/settings.json",
+              project / ".claude/settings.local.json"):
+        s = jread(p)
+        merged.update(s)
+        models.update(s.get("modelSettings") or {})
+    mid = re.sub(r"\[\d+m\]$", "", model_id)
+    e = next((v.get("effortLevel") for k, v in models.items()
+              if isinstance(v, dict) and (mid == k or mid.startswith(k + "-"))), None)
+    return e or merged.get("effortLevel") or ""
+
 def subagent():
     inp = json.load(sys.stdin)
-    # The payload omits effort when a task inherits the session level, so fall
-    # back to the persisted effortLevel (misses mid-session /effort changes).
-    fb = jread(CLAUDE / "settings.json").get("effortLevel") or ""
+    project = Path(os.environ.get("CLAUDE_PROJECT_DIR") or inp.get("cwd") or os.getcwd())
     now = time.time() * 1000
     for t in inp.get("tasks") or []:
         if t.get("model"):  # model unresolved → keep the default row
+            fb = session_effort(t["model"], project)
             print(json.dumps({"id": t["id"], "content": build_row(t, fb, inp.get("columns"), now)}))
 
 # --------------------------------------------------------- background workers
