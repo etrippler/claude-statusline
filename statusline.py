@@ -217,6 +217,7 @@ def render():
     ws = inp.get("workspace") or {}
     cwd = ws.get("current_dir") or os.getcwd()
     repo = ws.get("repo") or {}
+    note_session(inp)
     g = git_info(cwd)
     url = (f"https://{repo['host']}/{repo['owner']}/{repo['name']}/tree/{g['branch']}"
            if repo.get("host") and g["branch"] else None)
@@ -307,44 +308,93 @@ def fmt_tokens(n):  # approximates the built-in compact en-US formatter
         if n >= div: return f"{n / div:.1f}{suf}"
     return str(n)
 
-def build_row(t, fallback, cols, now):
+EFFORT_SHORT = {"low": "lo", "medium": "med", "high": "hi", "xhigh": "xh", "max": "max"}
+
+def fmt_effort_short(e):
+    if isinstance(e, (int, float)): return f"{round(e / 1000)}k"
+    return EFFORT_SHORT.get(e, e or "")
+
+def fmt_model_short(mid):  # "claude-fable-5-1[1m]" → "F5.1"
+    name, _, ver = fmt_model_id(base_model(mid)).partition(" ")
+    return name[:1] + ver if ver else name
+
+def base_model(mid): return re.sub(r"\[\d+m\]$", "", mid or "")
+
+def same_model(a, b): return bool(a and b) and base_model(a) == base_model(b)
+
+def build_row(t, sess, fallback, cols, now):
+    # Agent first, then a terse spec: the model only when it isn't the session's.
     sep = " · "
-    eff = fmt_effort(t.get("effort"), fallback)
-    model = fmt_model_id(t.get("model") or "")
-    left = sep.join(x for x in (t.get("name"), f"{model} {eff}" if eff else model) if x)
-    right = sep.join(x for x in (fmt_elapsed(now - t["startTime"]) if t.get("startTime") else "",
+    typ, name = t.get("agentType") or "", t.get("name") or ""
+    if typ == "general-purpose": typ = ""
+    who = (f"{name} ({typ})" if name and typ and name.lower() != typ.lower()
+           else name or typ or "agent")
+    if t.get("cwd") and sess.get("cwd") and t["cwd"] != sess["cwd"]:  # isolated worktree
+        who += f" \u2387 {os.path.basename(t['cwd'])}"
+    spec = " ".join(x for x in ("" if same_model(t["model"], sess.get("model")) else fmt_model_short(t["model"]),
+                                fmt_effort_short(t.get("effort") or fallback)) if x)
+    head = f"{who} {spec}" if spec else who
+
+    status = t.get("status") or "running"
+    mark = {"completed": green("✓"), "failed": red("✗"), "killed": yellow("✗")}.get(status, "")
+    # No end time in the payload: a finished row's elapsed would keep counting.
+    right = sep.join(x for x in (fmt_elapsed(now - t["startTime"]) if status == "running" and t.get("startTime") else "",
                                  f"↓ {fmt_tokens(t['tokenCount'])} tokens" if t.get("tokenCount") else "") if x)
-    desc = t.get("description")
-    room = cols - len(left) - len(right) - 5 if cols else 9e9
-    if desc and room > 8:
-        left += sep + (desc[:int(room) - 1] + "…" if len(desc) > room else desc)
-    pad = cols - len(left) - len(right) if cols else 0
-    return dim(left + " " * pad + right if right and pad > 0 else sep.join(x for x in (left, right) if x))
+    label = t.get("label") or t.get("description") or ""
+    room = cols - len(head) - len(sep) - (2 if mark else 0) - len(right) - 2 if cols else 9e9
+    out = dim(head)
+    if label and room > 8:
+        if len(label) > room: label = label[:int(room) - 1] + "…"
+        out += dim(sep) + (mark + " " if mark else "") + dim(label)
+    elif mark:
+        out += " " + mark
+    if right:
+        pad = cols - vw(out) - len(right) if cols else 0
+        out += dim(" " * pad + right if pad > 0 else sep + right)
+    return out
+
+# Subagent rows carry no session model or effort; the main line has both, live
+# (mid-session /model and /effort included). Each render leaves them here.
+def session_file(sid):
+    sid = re.sub(r"[^\w-]", "", sid or "")
+    return Path(f"/tmp/claude-statusline-session-{sid}.json") if sid else None
+
+def note_session(inp):
+    f = session_file(inp.get("session_id"))
+    if not f: return
+    s = {"model": (inp.get("model") or {}).get("id") or "", "effort": (inp.get("effort") or {}).get("level") or ""}
+    if jread(f) != s: f.write_text(json.dumps(s))
 
 def session_effort(model_id, project):
-    # Claude Code omits a task's effort when it inherits the session's, so rebuild
-    # that from the settings cascade the way it does: merge user < project < local
-    # per key, then modelSettings[model] over the plain effortLevel. A mid-session
-    # /effort change lives only in memory and can't be recovered here.
+    # Fallback when the live session effort doesn't apply (another model, or no
+    # main render yet): rebuild it from the settings cascade the way Claude Code
+    # does — merge user < project < local per key, then modelSettings[model]
+    # over the plain effortLevel.
     merged, models = {}, {}
     for p in (CLAUDE / "settings.json", project / ".claude/settings.json",
               project / ".claude/settings.local.json"):
         s = jread(p)
         merged.update(s)
         models.update(s.get("modelSettings") or {})
-    mid = re.sub(r"\[\d+m\]$", "", model_id)
-    e = next((v.get("effortLevel") for k, v in models.items()
-              if isinstance(v, dict) and (mid == k or mid.startswith(k + "-"))), None)
+    mid = base_model(model_id)
+    # Longest key wins: "claude-opus-5" must not shadow "claude-opus-5-5".
+    keys = [k for k, v in models.items() if isinstance(v, dict) and v.get("effortLevel")
+            and (mid == k or mid.startswith(k + "-"))]
+    e = models[max(keys, key=len)]["effortLevel"] if keys else None
     return e or merged.get("effortLevel") or ""
 
 def subagent():
     inp = json.load(sys.stdin)
     project = Path(os.environ.get("CLAUDE_PROJECT_DIR") or inp.get("cwd") or os.getcwd())
+    f = session_file(inp.get("session_id"))
+    sess = {**(jread(f) if f else {}), "cwd": inp.get("cwd") or ""}
     now = time.time() * 1000
     for t in inp.get("tasks") or []:
-        if t.get("model"):  # model unresolved → keep the default row
-            fb = session_effort(t["model"], project)
-            print(json.dumps({"id": t["id"], "content": build_row(t, fb, inp.get("columns"), now)}))
+        if not t.get("model"): continue  # model unresolved → keep the default row
+        fb = ""
+        if not t.get("effort"):  # inherited: the live session effort when it's the session's model
+            fb = (same_model(t["model"], sess.get("model")) and sess.get("effort")) or session_effort(t["model"], project)
+        print(json.dumps({"id": t["id"], "content": build_row(t, sess, fb, inp.get("columns"), now)}))
 
 # --------------------------------------------------------- background workers
 
