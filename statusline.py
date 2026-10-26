@@ -17,7 +17,7 @@ CONF = Path(os.environ.get("CLAUDE_STATUSLINE_CONFIG") or CLAUDE / "statusline.j
 CACHE = Path("/tmp/claude-statusline-cache.json")
 STAMP = Path("/tmp/claude-statusline-update-stamp")
 
-SEGMENTS = "repo branch diff ci model context percent cost limits version".split()
+SEGMENTS = "repo branch diff ci model context percent cost cache limits version".split()
 DEFAULTS = dict.fromkeys(SEGMENTS + ["update"], True)  # "update" gates self-update, not a segment
 
 # A statusline must never take the index lock: `git diff` opportunistically
@@ -103,10 +103,20 @@ def fmt_effort(e, fallback=""):  # low|medium|high|xhigh|max, or a token budget
     e = e or fallback
     if not e: return ""
     if isinstance(e, (int, float)): return f"{round(e / 1000)}k"
-    return "XHigh" if e == "xhigh" else e[0].upper() + e[1:]
+    return {"low": "L", "medium": "M", "high": "H", "xhigh": "XH", "max": "MAX"}.get(e, e)
 
 def fmt_reset(epoch):
     return datetime.fromtimestamp(epoch).strftime("%-I:%M%p").replace(":00", "")  # 7:00PM → 7PM
+
+def fmt_cache(pc):  # "cache 42m" while warm; "cold ↻78k" = what the next turn re-writes
+    if not (pc or {}).get("caching_observed"): return ""
+    left = (pc.get("expires_at") or 0) - time.time()
+    if not pc.get("warm") or left <= 0:
+        n = pc.get("recache_tokens_if_cold") or 0
+        return red("cold") + (" " + dim(f"↻{fmt_tokens(n)}") if n else "")
+    ttl = 3600 if pc.get("ttl") == "1h" else 300
+    c = green if left > ttl / 2 else yellow if left > min(300, ttl / 5) else red  # 1h: red under 5m
+    return dim("cache ") + c(f"{max(1, round(left / 60))}m")
 
 def fmt_limits(rl):
     fh = (rl or {}).get("five_hour") or {}
@@ -216,6 +226,7 @@ def render():
     inp = json.load(sys.stdin)
     ws = inp.get("workspace") or {}
     cwd = ws.get("current_dir") or os.getcwd()
+    project = Path(ws.get("project_dir") or cwd)
     repo = ws.get("repo") or {}
     note_session(inp)
     g = git_info(cwd)
@@ -268,14 +279,18 @@ def render():
         if style and style.lower() != "default": s += " " + dim(f"~ {style}")
         right.append(s)
     if on["percent"]: right.append(yellow(f"{tok * 100 / size:.1f}%"))
-    if on["context"] and tok: right.append(white(f"{tok / 1000:.1f}/{round(size / 1000)}"))
+    if on["context"] and tok:
+        ac = autocompact_at(inp, size, project)  # soft limit in white, hard limit dimmed
+        ctx = f"{tok / 1000:.1f}/" + (f"{round(ac / 1000)}" if ac else f"{round(size / 1000)}")
+        right.append(white(ctx) + (dim(f"/{round(size / 1000)}") if ac else ""))
     if on["cost"]: right.append(green(fmt_cost((inp.get("cost") or {}).get("total_cost_usd") or 0)))
 
     sep = f" {dim('|')} "
     line = sep.join([left] + right)
     # Account-level meta right-justifies. Claude Code's statusline area is a few
     # cells narrower than COLUMNS; overshooting gets the tail truncated to "…".
-    meta = sep.join(x for x in (fmt_limits(inp.get("rate_limits")) if on["limits"] else "",
+    meta = sep.join(x for x in (fmt_cache(inp.get("prompt_cache")) if on["cache"] else "",
+                                fmt_limits(inp.get("rate_limits")) if on["limits"] else "",
                                 dim("v" + inp["version"]) if on["version"] and inp.get("version") else "") if x)
     if meta:
         cols = int(c) if (c := os.environ.get("COLUMNS", "")).isdigit() else 0
@@ -365,11 +380,9 @@ def note_session(inp):
     s = {"model": (inp.get("model") or {}).get("id") or "", "effort": (inp.get("effort") or {}).get("level") or ""}
     if jread(f) != s: f.write_text(json.dumps(s))
 
-def session_effort(model_id, project):
-    # Fallback when the live session effort doesn't apply (another model, or no
-    # main render yet): rebuild it from the settings cascade the way Claude Code
-    # does — merge user < project < local per key, then modelSettings[model]
-    # over the plain effortLevel.
+def model_setting(key, model_id, project):
+    # Rebuild a setting from the cascade the way Claude Code does — merge
+    # user < project < local per key, then modelSettings[model] over the plain key.
     merged, models = {}, {}
     for p in (CLAUDE / "settings.json", project / ".claude/settings.json",
               project / ".claude/settings.local.json"):
@@ -378,10 +391,25 @@ def session_effort(model_id, project):
         models.update(s.get("modelSettings") or {})
     mid = base_model(model_id)
     # Longest key wins: "claude-opus-5" must not shadow "claude-opus-5-5".
-    keys = [k for k, v in models.items() if isinstance(v, dict) and v.get("effortLevel")
+    keys = [k for k, v in models.items() if isinstance(v, dict) and v.get(key) is not None
             and (mid == k or mid.startswith(k + "-"))]
-    e = models[max(keys, key=len)]["effortLevel"] if keys else None
-    return e or merged.get("effortLevel") or ""
+    v = models[max(keys, key=len)][key] if keys else None
+    return v if v is not None else merged.get(key)
+
+def session_effort(model_id, project):
+    # Fallback when the live session effort doesn't apply (another model, or no
+    # main render yet).
+    return model_setting("effortLevel", model_id, project) or ""
+
+def autocompact_at(inp, size, project):  # tokens, or None when off / same as the window
+    mid = (inp.get("model") or {}).get("id") or ""
+    on = model_setting("autoCompactEnabled", mid, project)
+    if on is None: on = jread(Path.home() / ".claude.json").get("autoCompactEnabled", True)  # /config writes here
+    if on is False: return None
+    at = model_setting("autoCompactWindow", mid, project) or size
+    pct = os.environ.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
+    if pct.replace(".", "", 1).isdigit(): at = min(at, size * float(pct) / 100)
+    return at if at < size else None
 
 def subagent():
     inp = json.load(sys.stdin)
