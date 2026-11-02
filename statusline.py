@@ -265,6 +265,8 @@ def render():
     u = cw.get("current_usage") or {}
     size = cw.get("context_window_size") or 200_000
     tok = sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    if not tok and cw.get("used_percentage"):  # Antigravity (agy) sends no current_usage, only the percentage
+        tok = round(cw["used_percentage"] * size / 100)
 
     right = []
     if on["ci"]:
