@@ -1,0 +1,50 @@
+# Rolling release: every push to main that touches the Rust build re-publishes
+# the binaries on the `latest` release, which `statusline update` fetches.
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths: [src/**, Cargo.toml, Cargo.lock, .github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-14, target: aarch64-apple-darwin, asset: statusline-macos-aarch64 }
+          - { runner: macos-14, target: x86_64-apple-darwin, asset: statusline-macos-x86_64 }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, asset: statusline-linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: statusline-linux-aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/statusline ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: |
+          gh release view latest >/dev/null 2>&1 ||
+            gh release create latest --title latest --notes "Rolling build of main." --target "$GITHUB_SHA"
+          gh release upload latest dist/* --clobber

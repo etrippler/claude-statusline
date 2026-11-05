@@ -29,6 +29,20 @@ python3 ~/.claude/statusline.py on cost
 - `update` fetches immediately. `off update` disables the background check; manual `update` still works.
 - A copy inside a git checkout never self-updates.
 
+## Rust build
+
+`src/` is a Rust port with the same segments, commands and config. A render takes ~5ms vs ~70ms for the Python version (plus your interpreter's startup), which makes a 1s `refreshInterval` cheap:
+
+- Repo, worktree, subdir and branch come from reading `.git` directly; upstream ahead/behind costs one `git for-each-ref`, cached until a ref file changes. A steady-state render spawns no processes.
+- The diff size and PR CI status refresh in detached workers, as before. Its cache and session files are separate from the Python version's (`/tmp/claude-statusline-rs-*`).
+
+```sh
+curl -fsSL https://github.com/etrippler/claude-statusline/releases/download/latest/statusline-macos-aarch64 -o ~/.claude/statusline
+chmod +x ~/.claude/statusline && ~/.claude/statusline install
+```
+
+Assets: `statusline-{macos,linux}-{aarch64,x86_64}`. A push to `main` that touches the Rust build re-publishes them on the rolling `latest` release (`.github/workflows/release.yml`), and installed binaries pick that up through `update`. From a checkout: `cargo build --release && target/release/statusline install` (a binary inside the checkout never self-updates).
+
 ## Developing
 
 Clone the repo and run `install` from the checkout — the working tree is then authoritative. Publish with `git push`.
