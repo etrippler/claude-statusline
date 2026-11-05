@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::OnceLock,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -201,14 +201,16 @@ pub fn refresh_diff(cwd: &Path) {
     let Some(repo) = Repo::discover(cwd) else { return };
     let Some(branch) = repo.branch() else { return };
     let run = |args: &[&str], secs| output(&mut git(cwd, args), Duration::from_secs(secs));
+    let started = Instant::now();
     let stat = run(&["merge-base", "origin/HEAD", "HEAD"], 2)
         .and_then(|base| run(&["diff", "--shortstat", &base], 30))
         .unwrap_or_default();
+    let took = started.elapsed().as_secs_f64();
     // "3 files changed, 10 insertions(+), 2 deletions(-)"
     let count = |word| {
         stat.split(", ")
             .find_map(|p| p.trim().split_once(' ').filter(|(_, w)| w.starts_with(word))?.0.parse().ok())
             .unwrap_or(0)
     };
-    Cache::put_diff(&repo.top, &branch, Diff { added: count("insertion"), removed: count("deletion") });
+    Cache::put_diff(&repo.top, &branch, Diff { added: count("insertion"), removed: count("deletion"), took });
 }
