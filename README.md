@@ -1,50 +1,46 @@
 # claude-statusline
 
-Claude Code status lines — main session line + subagent rows.
+Claude Code status lines — main session line + subagent rows — in one Rust binary. A render takes ~5ms and usually spawns no processes, so a 1s `refreshInterval` is cheap.
 
 ## Install
 
+From a clone (needs a Rust toolchain):
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/etrippler/claude-statusline/main/statusline.py -o ~/.claude/statusline.py
-python3 ~/.claude/statusline.py install
+git clone https://github.com/etrippler/claude-statusline && cd claude-statusline
+cargo build --release && target/release/statusline install
 ```
 
-- `install` points `statusLine` and `subagentStatusLine` in `~/.claude/settings.json` at the file. 
-- `install PATH` targets another settings file instead - e.g. `project/.claude/settings.local.json`.
-- `install --no-update` disables background updates.
+Or a prebuilt binary, put at `~/.claude/statusline` (`$STATUSLINE_DIR` to relocate):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/etrippler/claude-statusline/main/install.sh | sh
+```
+
+- `install` points `statusLine` and `subagentStatusLine` in `~/.claude/settings.json` at the binary.
+- `install PATH` targets another settings file instead — e.g. `project/.claude/settings.local.json`. Through the script: `sh -s -- PATH`.
 
 ## Configure
 
 ```sh
-python3 ~/.claude/statusline.py toggles      # list toggles and their state
-python3 ~/.claude/statusline.py off cost     # hide a segment
-python3 ~/.claude/statusline.py on cost
+statusline toggles      # list segments and their state
+statusline off cost     # hide a segment
+statusline on cost
 ```
 
-- See `~/.claude/statusline.json`, configure with `$CLAUDE_STATUSLINE_CONFIG` 
+Toggles live in `~/.claude/statusline.json`; `$CLAUDE_STATUSLINE_CONFIG` relocates it.
 
-## Updating
+## Update
 
-- Renders spawn a background version check at most hourly; replaces itself atomically. 
-- `update` fetches immediately. `off update` disables the background check; manual `update` still works.
-- A copy inside a git checkout never self-updates.
+Nothing updates on its own. `statusline update` does it when you ask: in a clone, `git pull --ff-only && cargo build --release`; otherwise it downloads the latest release over itself. Releases are built by CI from every push to `main` that touches the Rust code (`.github/workflows/release.yml`), as `statusline-{macos,linux}-{aarch64,x86_64}` on the rolling `latest` release.
 
-## Rust build
+## How it stays fast
 
-`src/` is a Rust port with the same segments, commands and config. A render takes ~5ms vs ~70ms for the Python version (plus your interpreter's startup), which makes a 1s `refreshInterval` cheap:
-
-- Repo, worktree, subdir and branch come from reading `.git` directly; upstream ahead/behind costs one `git for-each-ref`, cached until a ref file changes. A steady-state render spawns no processes.
-- The diff size and PR CI status refresh in detached workers, as before. Its cache and session files are separate from the Python version's (`/tmp/claude-statusline-rs-*`).
-
-```sh
-curl -fsSL https://github.com/etrippler/claude-statusline/releases/download/latest/statusline-macos-aarch64 -o ~/.claude/statusline
-chmod +x ~/.claude/statusline && ~/.claude/statusline install
-```
-
-Assets: `statusline-{macos,linux}-{aarch64,x86_64}`. A push to `main` that touches the Rust build re-publishes them on the rolling `latest` release (`.github/workflows/release.yml`), and installed binaries pick that up through `update`. From a checkout: `cargo build --release && target/release/statusline install` (a binary inside the checkout never self-updates).
-
-## Developing
-
-Clone the repo and run `install` from the checkout — the working tree is then authoritative. Publish with `git push`.
+- Repo, worktree, subdir and branch are read straight from `.git`. Upstream ahead/behind costs one `git for-each-ref`, cached until a ref file changes.
+- The diff size and the PR's CI status refresh in detached workers. The diff refreshes at ~20× its own cost (1–60s), so it tracks edits within a second on a typical repo.
+- On macOS, git calls skip Apple's `/usr/bin/git` xcrun shim (~10ms each).
+- State lives in `/tmp/claude-statusline-rs-*`, written atomically.
 
 The branch glyph is Powerline (U+E0A0); use a Powerline-capable font.
+
+`archive/statusline.py` is the original Python version, kept for reference.

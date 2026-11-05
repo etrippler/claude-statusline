@@ -1,5 +1,5 @@
 //! Claude Code status lines — main session line + subagent rows — in one
-//! self-updating binary. `statusline --help` for commands.
+//! binary. `statusline --help` for commands.
 //!
 //! The branch glyph is Powerline (U+E0A0): use a Powerline-capable font.
 
@@ -15,7 +15,7 @@ mod settings;
 mod store;
 
 use ansi::{dim, green, red};
-use proc::{self_path, spawn_detached};
+use proc::self_path;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use settings::{Toggle, Toggles, claude_dir, expand_tilde, home};
@@ -24,44 +24,33 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, ExitCode, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use store::{REFRESH_DIFF, REFRESH_PR, read_json, write_atomic};
 
 const RELEASES: &str = "https://github.com/etrippler/claude-statusline/releases/download/latest";
-const UPDATE_STAMP: &str = "/tmp/claude-statusline-rs-update-stamp";
 
 pub fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
-// ---------------------------------------------------------------- self-update
+// --------------------------------------------------------------------- update
 
-/// A binary built inside this repo is a dev copy: git is authoritative.
-fn in_checkout() -> bool {
+/// The repo this binary was built in, when it's running from there: a clone
+/// updates through git, not releases.
+fn checkout() -> Option<&'static Path> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    self_path().starts_with(root) && root.join(".git").exists()
+    (self_path().starts_with(root) && root.join(".git").exists()).then_some(root)
 }
 
-/// Rides along on every render: at most hourly, a detached `update`.
-fn maybe_update() {
-    let fresh = fs::metadata(UPDATE_STAMP)
-        .and_then(|m| m.modified())
-        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < Duration::from_secs(3600)));
-    if fresh || in_checkout() || !Toggles::load().on(Toggle::Update) {
-        return;
-    }
-    touch(UPDATE_STAMP); // before spawning, so concurrent sessions stay single-flight
-    spawn_detached(["update"]);
-}
-
-fn touch(p: &str) {
-    let _ = fs::OpenOptions::new().create(true).append(true).open(p).and_then(|f| f.set_modified(SystemTime::now()));
-}
-
+/// Never automatic: you run it when you want new code.
 fn update() -> Result<(), String> {
-    if in_checkout() {
-        return Err("this copy lives in a git checkout — use git pull && cargo build --release".into());
+    if let Some(root) = checkout() {
+        let ok = |cmd: &mut Command| cmd.current_dir(root).status().is_ok_and(|s| s.success());
+        return (ok(Command::new("git").args(["pull", "--ff-only"]))
+            && ok(Command::new("cargo").args(["build", "--release"])))
+        .then_some(())
+        .ok_or_else(|| format!("update failed in {}", root.display()));
     }
     let url = format!("{RELEASES}/statusline-{}-{}", env::consts::OS, env::consts::ARCH);
     let new = Command::new("curl")
@@ -71,7 +60,6 @@ fn update() -> Result<(), String> {
         .filter(|o| o.status.success() && !o.stdout.is_empty())
         .ok_or(format!("could not fetch {url}"))?
         .stdout;
-    touch(UPDATE_STAMP);
     let me = self_path();
     if fs::read(&me).is_ok_and(|cur| cur == new) {
         println!("already up to date");
@@ -95,18 +83,18 @@ fn update() -> Result<(), String> {
 // ------------------------------------------------------------------- commands
 
 fn usage() -> String {
-    let segments: Vec<_> = Toggle::segments().map(Toggle::name).collect();
+    let segments: Vec<_> = Toggle::ALL.map(Toggle::name).into();
     format!(
-        "claude-statusline — Claude Code status lines in one self-updating binary
+        "claude-statusline — Claude Code status lines in one binary
 
 usage: statusline [command]     (no command: render the main line; JSON on stdin)
 
   subagent      render subagent task rows (JSON on stdin)
-  toggles       list toggles: the segments, plus 'update' (the hourly background check)
-  on|off KEY    flip a toggle persistently
-  update        fetch the latest release now (works even with 'update' toggled off)
+  toggles       list the segments and whether each is on
+  on|off KEY    flip a segment persistently
+  update        a clone: git pull + cargo build; otherwise: download the latest release
   install [SETTINGS]   point a settings.json at this binary — default ~/.claude/settings.json,
-                       or a project's .claude/settings.json (--no-update: also 'off update')
+                       or a project's .claude/settings.json
 
 segments: {}
 config:   {} — set $CLAUDE_STATUSLINE_CONFIG to relocate
@@ -132,7 +120,7 @@ fn list_toggles() {
     }
 }
 
-fn install(target: Option<&str>, no_update: bool) -> Result<(), String> {
+fn install(target: Option<&str>) -> Result<(), String> {
     let path = target.map_or_else(|| claude_dir().join("settings.json"), expand_tilde);
     let fail = |e: io::Error| format!("{}: {e}", path.display());
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -147,12 +135,6 @@ fn install(target: Option<&str>, no_update: bool) -> Result<(), String> {
     let body = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())? + "\n";
     write_atomic(&path, &body).map_err(fail)?;
     println!("{} statusLine + subagentStatusLine → {cmd}", path.display());
-    if in_checkout() {
-        println!("(running from a git checkout: auto-update stays off; rebuild with cargo)");
-    }
-    if no_update {
-        toggle("update", false)?;
-    }
     Ok(())
 }
 
@@ -179,25 +161,18 @@ fn run(args: &[&str]) -> Result<(), String> {
     match args {
         ["-h" | "--help" | "help", ..] => print!("{}", usage()),
         ["update", ..] => update()?,
-        ["install", rest @ ..] => {
-            let target = rest.iter().find(|a| **a != "--no-update").copied();
-            install(target, rest.contains(&"--no-update"))?;
-        }
+        ["install", target @ ..] => install(target.first().copied())?,
         ["toggles", ..] => list_toggles(),
         [cmd @ ("on" | "off"), key, ..] => toggle(key, *cmd == "on")?,
         ["on" | "off"] => return Err("usage: statusline on|off KEY".into()),
         [REFRESH_PR, branch, owner, name, ..] => ci::refresh(branch, owner, name),
         [REFRESH_DIFF, cwd, ..] => git::refresh_diff(Path::new(cwd)),
         ["subagent", ..] => {
-            maybe_update();
             for row in agents::render(&read_stdin()?) {
                 println!("{row}");
             }
         }
-        _ => {
-            maybe_update();
-            println!("{}", line::render(&read_stdin()?, &Toggles::load()));
-        }
+        _ => println!("{}", line::render(&read_stdin()?, &Toggles::load())),
     }
     Ok(())
 }

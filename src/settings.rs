@@ -39,17 +39,15 @@ pub enum Toggle {
     Cache,
     Limits,
     Version,
-    /// Gates the hourly self-update rather than a segment.
-    Update,
 }
 
 impl Toggle {
-    pub const ALL: [Toggle; 12] = {
+    pub const ALL: [Toggle; 11] = {
         use Toggle::*;
-        [Repo, Branch, Diff, Ci, Model, Context, Percent, Cost, Cache, Limits, Version, Update]
+        [Repo, Branch, Diff, Ci, Model, Context, Percent, Cost, Cache, Limits, Version]
     };
-    const NAMES: [&str; 12] =
-        ["repo", "branch", "diff", "ci", "model", "context", "percent", "cost", "cache", "limits", "version", "update"];
+    const NAMES: [&str; 11] =
+        ["repo", "branch", "diff", "ci", "model", "context", "percent", "cost", "cache", "limits", "version"];
 
     pub fn name(self) -> &'static str {
         Self::NAMES[self as usize]
@@ -57,10 +55,6 @@ impl Toggle {
 
     pub fn parse(s: &str) -> Option<Toggle> {
         Self::NAMES.iter().position(|&n| n == s).map(|i| Self::ALL[i])
-    }
-
-    pub fn segments() -> impl Iterator<Item = Toggle> {
-        Self::ALL.into_iter().filter(|&t| t != Toggle::Update)
     }
 }
 
