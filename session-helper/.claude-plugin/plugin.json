@@ -1,6 +1,6 @@
 {
-  "name": "threads",
-  "version": "0.1.0",
-  "description": "Plain-text session transcripts in $CC_SESSIONS, bodies of work ranked by attention, and compaction that points into the transcript",
+  "name": "session-helper",
+  "version": "0.2.0",
+  "description": "Plain-text session transcripts with the references each used, bodies of work ranked by attention, and a pointer to the session a /clear ended",
   "types": "./types/index.d.ts"
 }

@@ -5,9 +5,9 @@
   cc-text link CHILD PARENT   record that CHILD followed PARENT after a /clear
   cc-text areas-input         print one line per recent interactive session, for classifying
   cc-text areas               rank views/areas.json by attention; write areas.md and areas.tsv; print JSON
-  cc-text handoff ID          print JSON for a compaction or /clear hand-off: scaffold, references in play, last exchange
+  cc-text previous ID         print JSON for the /clear pointer: length, last asks, area, top references
 
-Layout under $CC_HOME (default ~/.claude/threads):
+Layout under $CC_HOME (default ~/.claude/session-helper):
   sessions/<id>.txt       one per session; every line starts with its role; line numbers never change
   sessions/<id>.refs.tsv  what the session used: line, compaction, op, kind, key, title (no header). Keys are
                           normalized (Slack channel/ts, owner/repo#N, Linear id, Notion page id, Granola meeting id,
@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 
 CONFIG = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
 PROJECTS = os.path.join(CONFIG, 'projects')
-HOME = os.environ.get('CC_HOME') or os.path.join(CONFIG, 'threads')
+HOME = os.environ.get('CC_HOME') or os.path.join(CONFIG, 'session-helper')
 SESSIONS = os.path.join(HOME, 'sessions')
 VIEWS = os.path.join(HOME, 'views')
 INDEX = os.path.join(HOME, 'index.tsv')
@@ -41,13 +41,8 @@ WINDOW_DAYS = 21
 HALF_LIFE_DAYS = 4
 MISC_BELOW = 0.04
 MISC = 'Misc'
-HANDOFF_TAIL_LINES = 40
-HANDOFF_TAIL_CHARS = 4000
-# The scaffold: the newest turns with how each ended, then older asks alone, then a count of the rest.
-SCAFFOLD_FULL_CHARS = 4500
-SCAFFOLD_ASK_CHARS = 1500
 # A reference scores its strongest use in each compaction segment, halved per compaction since; below REFS_FLOOR it
-# leaves the note. Taking the strongest use, not the sum, means coming back to something keeps it, a burst doesn't.
+# drops out of the /clear pointer. Taking the strongest use, not the sum, means coming back to something keeps it, a burst doesn't.
 OP_WEIGHT = {'edit': 3, 'made': 3, 'pasted': 2, 'cited': 1.5, 'read': 1}
 REFS_FLOOR = 0.5
 REFS_SHOWN = 12
@@ -602,62 +597,6 @@ def tool_group(name):
             'Grep': 'search', 'Glob': 'search'}.get(name, name)
 
 
-def scaffold(lines):
-    """The user's asks by line, each with how the turn ended: its tool calls and the first line of Claude's last reply.
-    The newest turns are shown whole, older asks alone, and the oldest are counted, apart from the first ask."""
-    turns, marks, prev = [], [], ''
-    for n, line in enumerate(lines, 1):
-        m = ASK.match(line)
-        if m and not re.fullmatch(r'/\S+', m.group(2).strip()):
-            turns.append({'line': n, 'ask': m.group(2), 'tools': {}, 'reply': None})
-        elif line.startswith('--- compacted'):
-            marks.append(n)
-        elif turns and line.startswith('tool: '):
-            group = tool_group(line[6:].split(':', 1)[0])
-            turns[-1]['tools'][group] = turns[-1]['tools'].get(group, 0) + 1
-        elif turns and line.startswith('claude: ') and prev != 'claude' and line[8:].strip():
-            turns[-1]['reply'] = (n, line[8:])
-        prev = line.split(':', 1)[0]
-
-    def ask_row(t):
-        return f"L{t['line']:<6}you: {one_line(t['ask'], 100)}"
-
-    def reply_row(t):
-        count = sum(t['tools'].values())
-        if not count and not t['reply']:
-            return None
-        top = sorted(t['tools'].items(), key=lambda kv: -kv[1])
-        tools = ', '.join(f'{k} {v}' if v > 1 else k for k, v in top[:4]) + (f' +{len(top) - 4}' if len(top) > 4 else '')
-        lead = f"[{count} tool{'s' if count > 1 else ''}: {tools}] " if count else ''
-        line, text = t['reply'] or (t['line'] + 1, '')
-        return f"L{line:<6}claude: {lead}{one_line(text.replace('**', '').lstrip('# '), 100)}"
-
-    shown, used, skipped = {}, 0, []
-    for i in range(len(turns) - 1, -1, -1):
-        t = turns[i]
-        rows = [ask_row(t)]
-        if used < SCAFFOLD_FULL_CHARS:
-            rows += [r for r in [reply_row(t)] if r]
-        cost = sum(len(r) + 1 for r in rows)
-        if i == 0 or used + cost <= SCAFFOLD_FULL_CHARS + SCAFFOLD_ASK_CHARS:
-            shown[i] = rows
-            used += cost
-        else:
-            skipped.append(i)
-    out, last = [], 0
-    for i, t in enumerate(turns):
-        if i not in shown:
-            continue
-        gap = [j for j in skipped if last <= j < i]
-        out += [f'L{n:<6}--- compacted ---' for n in marks if (turns[i - 1]['line'] if i else 0) < n < t['line']]
-        if gap:
-            out.append(f"…      {len(gap)} asks, L{turns[gap[0]]['line']}–L{turns[gap[-1]]['line']}")
-        out += shown[i]
-        last = i
-    out += [f'L{n:<6}--- compacted ---' for n in marks if turns and n > turns[-1]['line']]
-    return '\n'.join(out), len(turns)
-
-
 def short_path(path):
     home = os.path.expanduser('~')
     return '~' + path[len(home):] if path.startswith(home) else path
@@ -724,12 +663,11 @@ def refs_in_play(session_id, epoch):
     hidden = len(others) - REFS_SHOWN + max(len(ranked) - DIRS_SHOWN, 0)
     if hidden > 0:
         rows.append(f'  … {hidden} more in play')
-    return '\n'.join(rows), rows[:5]
+    return rows
 
 
-def cmd_handoff(session_id):
-    """For a compaction or a /clear: the scaffold, the references in play, the asks by line, and the last exchange
-    (for a compaction mid-task), cut to its final lines when it is long."""
+def cmd_previous(session_id):
+    """For the /clear pointer: how long the cleared session ran, its last asks by line, its area and top references."""
     with open(os.path.join(SESSIONS, session_id + '.txt')) as f:
         lines = f.read().split('\n')
     if lines and lines[-1] == '':
@@ -740,21 +678,14 @@ def cmd_handoff(session_id):
         m = ASK.match(line)
         if m and not re.fullmatch(r'/\S+', m.group(2).strip()):
             asks.append({'line': n, 'at': m.group(1), 'text': one_line(m.group(2), 110)})
-    outline, total = scaffold(lines)
-    refs, top = refs_in_play(session_id, meta.get('compactions', 0))
-    start = max(asks[-1]['line'] if asks else 1, len(lines) - HANDOFF_TAIL_LINES + 1, 1)
-    tail = '\n'.join(lines[start - 1:])
-    if len(tail) > HANDOFF_TAIL_CHARS:
-        tail = '…' + tail[-HANDOFF_TAIL_CHARS:]
     area = ''
     try:
         with open(os.path.join(VIEWS, 'areas.tsv')) as f:
             area = next((row.split('\t')[1] for row in f if row.startswith(session_id + '\t')), '')
     except OSError:
         pass
-    print(json.dumps({'lines': len(lines), 'asks': asks[-3:], 'asksTotal': total, 'scaffold': outline, 'refs': refs,
-                      'refsTop': '\n'.join(top), 'tailStart': start, 'tail': tail, 'area': area,
-                      'title': title(meta) if meta.get('id') else ''}))
+    top = refs_in_play(session_id, meta.get('compactions', 0))[:5]
+    print(json.dumps({'lines': len(lines), 'asks': asks[-3:], 'refsTop': '\n'.join(top), 'area': area}))
 
 
 def main(argv):
@@ -763,7 +694,7 @@ def main(argv):
         'link': lambda a: cmd_link(*a) if len(a) == 2 else None,
         'areas-input': lambda a: cmd_areas_input(),
         'areas': lambda a: cmd_areas(),
-        'handoff': lambda a: cmd_handoff(a[0]) if len(a) == 1 else None,
+        'previous': lambda a: cmd_previous(a[0]) if len(a) == 1 else None,
     }
     if not argv or argv[0] not in commands:
         print(__doc__)

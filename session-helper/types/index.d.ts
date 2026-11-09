@@ -7,6 +7,6 @@ export type Area = {
 
 declare module 'claude-code' {
   interface PluginState {
-    threads: { areas: Shaped<Area[]> }
+    'session-helper': { areas: Shaped<Area[]> }
   }
 }
