@@ -4,21 +4,19 @@ A Claude Code mod that gives every session cheap access to every other session. 
 
 ## What it changes in Claude Code
 
-- **Session start:** the first message's context gets a `bodiesOfWork` block, a ranked list like `- On-call week 12%: handoffs, tickets, runbooks moved into the repo` with a pointer to `$CC_VIEWS/areas.md` (interactive sessions only).
-- **Every Bash call:** `$CC_HOME`, `$CC_SESSIONS`, `$CC_INDEX`, `$CC_VIEWS` and `$CC_SESSION` are set in the environment, pointing at the text copies; nothing reads them unless Claude does.
-- **After `/clear`:** the first message also gets a `previousSession` block with the cleared session's id, length, body of work, last three asks and top references, and `$CC_PREV_SESSION` points at its transcript.
-- **After a compaction:** `bodiesOfWork` is sent again; the compaction itself is the engine's own, unchanged, and `previousSession` isn't repeated.
-- **Slash commands:** `/areas` is added, which regroups the bodies of work now instead of waiting for the hourly regroup.
-- **CLAUDE.md:** nothing is injected; the section you paste in (see Install) is what tells Claude when to use the files.
-- **Headless runs (`-p`, SDK):** env vars only, no blocks and no model calls.
-- **Everything else** (prompts, tool calls, permissions, the transcript itself) is untouched; the mod's only other effect is background work: syncing the text copies after each turn and at most one Sonnet call an hour to regroup.
+- **Session start:** a `bodiesOfWork` block in the first message, ranking your recent bodies of work, e.g. `- On-call week 12%: handoffs, tickets, runbooks moved into the repo`.
+- **Bash environment:** `$CC_HOME`, `$CC_SESSIONS`, `$CC_INDEX`, `$CC_VIEWS` and `$CC_SESSION`, pointing at the text copies.
+- **After `/clear`:** a `previousSession` block with the cleared session's last asks and top references, and `$CC_PREV_SESSION` pointing at its transcript.
+- **After a compaction:** `bodiesOfWork` again.
+- **Slash commands:** `/areas`, to regroup the bodies of work now.
+- **CLAUDE.md:** nothing; the section you paste in (see Install) is what tells Claude to use the files.
 
 - **Plain-text transcripts.** Every session gets a copy at `$CC_SESSIONS/<id>.txt`, synced after each turn. Every line starts with its role (`you:`, `claude:`, `tool:`, `result:`, `note:`), and line numbers never change, so `file:line` pointers stay valid.
 - **References.** Beside each copy, `<id>.refs.tsv` lists the Slack threads, PRs, Linear issues, Notion pages, Granola meetings, artifacts and files the session used, with titles. Keys are normalized, so `rg TRA-2448 $CC_SESSIONS/*.refs.tsv` finds every session that touched one.
 - **Bodies of work.** At most once an hour, Sonnet groups the last three weeks of sessions into 4–8 bodies of work. They're ranked locally by typing, active time and output, and the ranking goes into each session's first message.
 - **`/clear` pointer.** After a `/clear`, the new conversation gets the cleared session's last asks and what it was using, and `$CC_PREV_SESSION` points at its transcript.
 
-Compaction is left to the engine. A custom compaction built from the text copy lived here until Nov 2026; it's in this repo's history in the commit that imported the mod.
+Prompts, tool calls, permissions and compaction are left to the engine; the mod's only other effect is background work. A custom compaction built from the text copy lived here until Nov 2026; it's in this repo's history in the commit that imported the mod.
 
 ## How it fits together
 
