@@ -1,0 +1,6 @@
+{
+  "name": "threads",
+  "version": "0.1.0",
+  "description": "Plain-text session transcripts in $CC_SESSIONS, bodies of work ranked by attention, and compaction that points into the transcript",
+  "types": "./types/index.d.ts"
+}

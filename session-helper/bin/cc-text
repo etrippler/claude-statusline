@@ -1,0 +1,776 @@
+#!/usr/bin/env python3
+"""Plain-text mirrors of Claude Code transcripts, for grep, sed and tail.
+
+  cc-text sync [ID ...]       convert new transcript lines (every session when no ID)
+  cc-text link CHILD PARENT   record that CHILD followed PARENT after a /clear
+  cc-text areas-input         print one line per recent interactive session, for classifying
+  cc-text areas               rank views/areas.json by attention; write areas.md and areas.tsv; print JSON
+  cc-text handoff ID          print JSON for a compaction or /clear hand-off: scaffold, references in play, last exchange
+
+Layout under $CC_HOME (default ~/.claude/threads):
+  sessions/<id>.txt       one per session; every line starts with its role; line numbers never change
+  sessions/<id>.refs.tsv  what the session used: line, compaction, op, kind, key, title (no header). Keys are
+                          normalized (Slack channel/ts, owner/repo#N, Linear id, Notion page id, Granola meeting id,
+                          artifact id, file path), so rg on a key across sessions/*.refs.tsv finds every session that used it
+  sessions/<id>.meta      cursor, facts for the index, and per-day attention
+  index.tsv           one row per session, newest first
+  lineage.tsv         child<TAB>parent, one row per /clear
+  views/              derived files, safe to delete and rebuild
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import sys
+from datetime import datetime, timedelta
+
+CONFIG = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')
+PROJECTS = os.path.join(CONFIG, 'projects')
+HOME = os.environ.get('CC_HOME') or os.path.join(CONFIG, 'threads')
+SESSIONS = os.path.join(HOME, 'sessions')
+VIEWS = os.path.join(HOME, 'views')
+INDEX = os.path.join(HOME, 'index.tsv')
+LINEAGE = os.path.join(HOME, 'lineage.tsv')
+
+PASTE_LINES = 60
+RESULT_CHARS = 160
+CALL_CHARS = 240
+GAP_CAP_MINUTES = 10
+WINDOW_DAYS = 21
+HALF_LIFE_DAYS = 4
+MISC_BELOW = 0.04
+MISC = 'Misc'
+HANDOFF_TAIL_LINES = 40
+HANDOFF_TAIL_CHARS = 4000
+# The scaffold: the newest turns with how each ended, then older asks alone, then a count of the rest.
+SCAFFOLD_FULL_CHARS = 4500
+SCAFFOLD_ASK_CHARS = 1500
+# A reference scores its strongest use in each compaction segment, halved per compaction since; below REFS_FLOOR it
+# leaves the note. Taking the strongest use, not the sum, means coming back to something keeps it, a burst doesn't.
+OP_WEIGHT = {'edit': 3, 'made': 3, 'pasted': 2, 'cited': 1.5, 'read': 1}
+REFS_FLOOR = 0.5
+REFS_SHOWN = 12
+DIRS_SHOWN = 6
+VERSION = 5
+# Titles seen in search results, kept per session so a link cited later can be named.
+TITLES_KEPT = 200
+ASK = re.compile(r'you: \[(\d\d-\d\d \d\d:\d\d)\] (.*)')
+REMINDER = re.compile(r'<system-reminder>.*?</system-reminder>', re.S)
+PASTE = re.compile(r'<pasted_content[^>]*>.*?</pasted_content>', re.S)
+
+
+URL_KEYS = [
+    (re.compile(r'github\.com/([\w.-]+/[\w.-]+)/(?:pull|issues)/(\d+)'), lambda m: ('github', f'{m[1]}#{m[2]}')),
+    (re.compile(r'linear\.app/[\w-]+/issue/([A-Z][A-Z0-9]*-\d+)'), lambda m: ('linear', m[1])),
+    (re.compile(r'notion\.(?:so|com|site)/[^\s)>\]"]*?([0-9a-f]{32})'), lambda m: ('notion', m[1])),
+    (re.compile(r'[\w-]+\.slack\.com/archives/(\w+)/p(\d{10})(\d{6})'), lambda m: ('slack', f'{m[1]}/{m[2]}.{m[3]}')),
+    (re.compile(r'notes\.granola\.ai/[a-z]/([0-9a-f-]{36})'), lambda m: ('granola', m[1])),
+    (re.compile(r'claude\.ai/(?:code/)?artifact/([\w-]+)'), lambda m: ('artifact', m[1])),
+]
+GH_PR = re.compile(r'\bgh pr (view|diff|checks|edit|comment|review|merge|ready) +(\d+)(?:.*?(?:-R|--repo)[ =]([\w.-]+/[\w.-]+))?')
+GH_API = re.compile(r'repos/([\w.-]+/[\w.-]+)/(?:pulls|issues)/(\d+)')
+
+
+def url_refs(text):
+    found = []
+    for pattern, key in URL_KEYS:
+        for m in pattern.finditer(text):
+            if key(m) not in found:
+                found.append(key(m))
+    return found
+
+
+def tool_refs(name, args):
+    """What a tool call touches, as (op, kind, key, title hint); a None key is read from the result."""
+    a = args if isinstance(args, dict) else {}
+    tool, low = name.split('__')[-1], name.lower()
+    if tool == 'Read':
+        return [('read', 'file', a.get('file_path'), '')]
+    if tool in ('Edit', 'Write', 'NotebookEdit'):
+        return [('edit', 'file', a.get('file_path') or a.get('notebook_path'), '')]
+    if tool == 'Artifact':
+        action = a.get('action') or 'publish'
+        if action == 'publish' and not a.get('asset'):
+            return [('made', 'artifact', None, a.get('title') or os.path.basename(a.get('file_path') or ''))]
+        if action == 'read' and a.get('url'):
+            return [('read', kind, key, '') for kind, key in url_refs(a['url'])]
+        return []
+    if tool == 'WebFetch' and a.get('url'):
+        return [('read', kind, key, '') for kind, key in url_refs(a['url'])] or [('read', 'web', a['url'], '')]
+    if tool == 'Bash':
+        # The first line only: a here-doc body is code or prose being written, not something looked up.
+        cmd = str(a.get('command', '')).split('\n', 1)[0]
+        out = [('read', kind, key, '') for kind, key in url_refs(cmd)]
+        for verb, number, repo in GH_PR.findall(cmd):
+            out.append(('read' if verb in ('view', 'diff', 'checks') else 'edit', 'github', f'{repo}#{number}', ''))
+        out += [('read', 'github', f'{repo}#{number}', '') for repo, number in GH_API.findall(cmd)]
+        if re.search(r'\bgh pr create\b', cmd):
+            out.append(('made', 'github', None, ''))
+        return out
+    query = a.get('query') or a.get('keywords')
+    if isinstance(query, list):
+        query = ', '.join(map(str, query))
+    if 'slack' in low:
+        if tool == 'slack_read_thread':
+            return [('read', 'slack', f"{a.get('channel_id')}/{a.get('message_ts')}", '')]
+        if tool in ('slack_read_channel', 'slack_read_canvas'):
+            return [('read', 'slack', a.get('channel_id') or a.get('canvas_id'), '')]
+        if tool.startswith('slack_send') or tool == 'slack_schedule_message':
+            ts = a.get('thread_ts')
+            return [('made', 'slack', f"{a.get('channel_id')}/{ts}" if ts else a.get('channel_id'), '')]
+    elif 'granola' in low:
+        ids = [a.get('meeting_id') or a.get('note_id')] + list(a.get('meeting_ids') or a.get('note_ids') or a.get('document_ids') or [])
+        return [('read', 'granola', m, '') for m in ids if m]
+    elif 'notion' in low:
+        page = re.search(r'[0-9a-f]{32}', str(a.get('id') or a.get('page_id') or '').replace('-', ''))
+        if page and tool == 'notion-fetch':
+            return [('read', 'notion', page[0], '')]
+        if page and tool in ('notion-update-page', 'notion-create-comment', 'notion-create-suggested-edit'):
+            return [('edit', 'notion', page[0], '')]
+        if tool == 'notion-create-pages':
+            return [('made', 'notion', None, '')]
+    elif 'linear' in low:
+        if tool == 'get_issue' and a.get('id'):
+            return [('read', 'linear', a['id'], '')]
+        if tool in ('save_issue', 'save_comment'):
+            return [('made' if not a.get('id') else 'edit', 'linear', a.get('issueId') or a.get('id'), '')]
+    if query and ('search' in tool or tool.startswith(('query', 'list_issues'))):
+        return [('search', tool_group(name).lower(), query, '')]
+    return []
+
+
+def result_text(block):
+    content = block.get('content')
+    if isinstance(content, list):
+        content = '\n'.join(b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
+    return str(content or '')
+
+
+def slack_clean(text):
+    text = re.sub(r'<@\w+\|([^>]+)>', r'@\1', text)
+    text = re.sub(r'<!subteam\^\w+(?:\|([^>]+))?>', lambda m: '@' + (m[1] or 'group'), text)
+    return re.sub(r'<(https?://[^|>]+)(?:\|([^>]+))?>', lambda m: m[2] or m[1], text)
+
+
+def decoded(text):
+    """Connector results are often a JSON object around the real text, with its newlines escaped."""
+    stripped = text.lstrip()
+    if stripped.startswith('{'):
+        try:
+            data = json.loads(stripped)
+        except ValueError:
+            return text
+        if isinstance(data, dict):
+            return '\n'.join(v for v in data.values() if isinstance(v, str)) or text
+    return text
+
+
+def harvest_titles(text, meta):
+    titles = meta.setdefault('titles', {})
+    for block in re.split(r'\n(?=### Result \d+)', text):
+        channel = re.search(r'Channel: ([^\n(]+?) \(ID: (\w+)\)', block)
+        if not channel:
+            continue
+        name = channel[1] if channel[1].startswith('#') else 'DM'
+        if name != 'DM':
+            titles.setdefault(channel[2], name)
+        ts = re.search(r'Message_ts: ([\d.]+)', block)
+        if ts:
+            sender = re.search(r'From: ([^<\n]+?) <', block)
+            body = re.search(r'Text:\s*(.+)', block)
+            titles[f'{channel[2]}/{ts[1]}'] = one_line(
+                f"{name} · {sender[1].strip() if sender else '?'}: {slack_clean(body[1]) if body else ''}", 90)
+    for m in re.finditer(r'<meeting id="([0-9a-f-]{36})" title="([^"]+)"', text):
+        titles[m[1]] = m[2]
+    while len(titles) > TITLES_KEPT:
+        titles.pop(next(iter(titles)))
+
+
+def find_title(kind, key, text):
+    if kind == 'slack':
+        channel = re.search(r'Channel: (#[\w-]+)', text)
+        if '/' not in key and channel:
+            return channel[1]
+        if '/' not in key and re.search(r'Channel: (Group )?DM', text):
+            people = []
+            for name in re.findall(r'^([^<\n:]+?) <[^@>\s|]+@[^>\s|]+>(?: \(external[^)]*\))?:', text, re.M):
+                if name.strip() not in people:
+                    people.append(name.strip())
+            return one_line(('Group DM: ' if 'Group DM' in text else 'DM: ') + ', '.join(people[:4]), 80)
+        thread = re.search(r'THREAD: (.+)', text)
+        if thread:
+            return one_line(slack_clean(thread[1]), 80)
+        parent = re.search(r'=== THREAD PARENT MESSAGE ===\nFrom: ([^<\n]+?) <.*?\nMessage TS: [\d.]+\n(.+)', text, re.S)
+        if parent:
+            return one_line(f'{parent[1].strip()}: {slack_clean(parent[2].split(chr(10))[0])}', 80)
+        return channel[1] if channel else ''
+    if kind == 'granola':
+        m = re.search(r'<meeting id="' + re.escape(key) + r'" title="([^"]+)"', text)
+        if m:
+            return m[1]
+    if kind == 'github':
+        m = re.search(r'^title:\s*(.+)$', text, re.M)
+        if m:
+            return one_line(m[1], 90)
+    m = re.search(r'"title"\s*:\s*"([^"]{1,120})"', text) or re.search(r'<title>([^<\[]{1,120})</title>', text)
+    return one_line(m[1], 90) if m else ''
+
+
+def parse_ts(ts):
+    try:
+        return datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone()
+    except (ValueError, AttributeError):
+        return None
+
+
+def one_line(text, cap):
+    text = ' '.join(str(text).split())
+    return text if len(text) <= cap else text[:cap - 1] + '…'
+
+
+def prefixed(role, text, stamp=''):
+    lines = text.rstrip().split('\n')
+    if role == 'you' and len(lines) > PASTE_LINES:
+        lines = lines[:PASTE_LINES] + [f'… ({len(lines) - PASTE_LINES} more lines in the raw transcript)']
+    return [(f'{role}: [{stamp}] ' if i == 0 and stamp else f'{role}: ') + line for i, line in enumerate(lines)]
+
+
+def call_summary(args):
+    if not isinstance(args, dict):
+        return one_line(args, CALL_CHARS)
+    for key in ('command', 'file_path', 'pattern', 'url', 'skill', 'query', 'description', 'prompt'):
+        if args.get(key):
+            extra = f" ({args['description']})" if key == 'command' and args.get('description') else ''
+            return one_line(f'{args[key]}{extra}', CALL_CHARS)
+    return one_line(json.dumps(args), CALL_CHARS)
+
+
+def result_summary(block):
+    content = block.get('content')
+    if isinstance(content, list):
+        content = '\n'.join(b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text')
+    lines = [l for l in str(content or '').split('\n') if l.strip()]
+    first = one_line(lines[0], RESULT_CHARS) if lines else '(empty)'
+    more = f' (+{len(lines) - 1} lines)' if len(lines) > 1 else ''
+    return f"result: {'error' if block.get('is_error') else 'ok'}: {first}{more}"
+
+
+def user_text_lines(text, stamp, meta, day):
+    text = REMINDER.sub('', text).strip()
+    if not text or text.startswith('<local-command-caveat>'):
+        return []
+    if text.startswith('<command-name>'):
+        name = re.search(r'<command-name>(.*?)</command-name>', text, re.S)
+        args = re.search(r'<command-args>(.*?)</command-args>', text, re.S)
+        return prefixed('you', f"{name.group(1).strip() if name else '/?'} {args.group(1).strip() if args else ''}".strip(), stamp)
+    if text.startswith('<local-command-stdout>'):
+        body = re.sub(r'</?local-command-std(out|err)>', '', text).strip()
+        return [f'note: {one_line(body, RESULT_CHARS)}'] if body else []
+    if text.startswith('<task-notification>'):
+        summary = re.search(r'<summary>(.*?)</summary>', text, re.S)
+        status = re.search(r'<status>(.*?)</status>', text, re.S)
+        label = summary.group(1) if summary else (status.group(1) if status else 'update')
+        return [f'note: task {one_line(label, RESULT_CHARS)}']
+    if text.startswith('<side-sessions-event>') or 'continued from a previous conversation' in text[:600]:
+        return []
+    # What the user wrote, not what they pasted.
+    own = len(PASTE.sub('', text).strip())
+    meta['you_chars'] += own
+    if day:
+        meta['days'].setdefault(day, [0, 0, 0])[0] += own
+    if not meta.get('first_msg'):
+        meta['first_msg'] = one_line(text, 100)
+    return prefixed('you', text, stamp)
+
+
+def resolve(block, meta, refs):
+    pending = meta.get('pending', {}).pop(block.get('tool_use_id'), None)
+    if not pending or block.get('is_error'):
+        return
+    line, epoch, items = pending
+    text = decoded(result_text(block)) if any(key is None or kind not in ('file', 'web') for _, kind, key, _ in items) else ''
+    if any(kind in ('slack', 'granola') for _, kind, _, _ in items):
+        harvest_titles(text, meta)
+    for op, kind, key, hint in items:
+        if key is None:
+            key = next((k for kd, k in url_refs(text) if kd == kind), None)
+        if not key:
+            continue
+        key = key if isinstance(key, str) else json.dumps(key, sort_keys=True)
+        title = hint or ('' if op == 'search' or kind in ('file', 'web') else find_title(kind, key, text))
+        refs.append((line, epoch, op, kind, key, title or meta.get('titles', {}).get(key, '')))
+
+
+def convert(record, meta, line0=0, refs=None):
+    refs = [] if refs is None else refs
+    kind = record.get('type')
+    if kind == 'ai-title':
+        meta['title_ai'] = record.get('aiTitle') or meta.get('title_ai')
+        return []
+    if kind == 'custom-title':
+        meta['title_custom'] = record.get('customTitle') or meta.get('title_custom')
+        return []
+    if record.get('isSidechain'):
+        return []
+    if record.get('entrypoint') and 'entry' not in meta:
+        meta['entry'] = record['entrypoint']
+    if record.get('cwd'):
+        meta['cwd'] = record['cwd']
+    t = parse_ts(record.get('timestamp'))
+    day = t.strftime('%Y-%m-%d') if t else ''
+    if t:
+        meta['first'] = meta.get('first') or record['timestamp']
+        meta['last'] = record['timestamp']
+        prev = parse_ts(meta.get('prev_ts'))
+        if prev:
+            gap = min(max((t - prev).total_seconds() / 60, 0), GAP_CAP_MINUTES)
+            meta['days'].setdefault(day, [0, 0, 0])[1] += round(gap, 2)
+        meta['prev_ts'] = record['timestamp']
+    if kind == 'system' and record.get('subtype') == 'compact_boundary':
+        m = record.get('compactMetadata') or {}
+        meta['compactions'] = meta.get('compactions', 0) + 1
+        sizes = f", {round(m['preTokens'] / 1000)}k tokens" if m.get('preTokens') else ''
+        return [f"--- compacted ({m.get('trigger', '?')}{sizes}); everything above stays here ---"]
+    if kind not in ('user', 'assistant'):
+        return []
+    content = (record.get('message') or {}).get('content')
+    stamp = t.strftime('%m-%d %H:%M') if t else ''
+    if kind == 'user':
+        if record.get('isCompactSummary') or record.get('isMeta'):
+            return []
+        if isinstance(content, str):
+            return user_text_lines(content, stamp, meta, day)
+        out = []
+        for block in content or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') == 'tool_result':
+                resolve(block, meta, refs)
+                out.append(result_summary(block))
+            elif block.get('type') == 'text':
+                out += user_text_lines(block.get('text', ''), stamp, meta, day)
+                stamp = ''
+            elif block.get('type') == 'image':
+                out.append('you: [image]')
+        return out
+    usage = (record.get('message') or {}).get('usage') or {}
+    if day and usage.get('output_tokens'):
+        meta['days'].setdefault(day, [0, 0, 0])[2] += usage['output_tokens']
+    out = []
+    for block in content or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get('type') == 'text' and block.get('text', '').strip():
+            out += prefixed('claude', block['text'])
+        elif block.get('type') == 'tool_use':
+            items = tool_refs(block.get('name', ''), block.get('input'))
+            if items and block.get('id'):
+                meta.setdefault('pending', {})[block['id']] = [line0 + len(out), meta.get('compactions', 0), items]
+            out.append(f"tool: {block.get('name')}: {call_summary(block.get('input'))}")
+    return out
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_text(path, text):
+    with open(path + '.tmp', 'w') as f:
+        f.write(text)
+    os.replace(path + '.tmp', path)
+
+
+def sync_one(src):
+    session_id = os.path.basename(src)[:-len('.jsonl')]
+    txt = os.path.join(SESSIONS, session_id + '.txt')
+    refs_path = os.path.join(SESSIONS, session_id + '.refs.tsv')
+    meta_path = os.path.join(SESSIONS, session_id + '.meta')
+    try:
+        size = os.path.getsize(src)
+    except OSError:
+        return False
+    meta = read_json(meta_path)
+    if meta and meta.get('offset') == size and meta.get('src') == src and meta.get('version') == VERSION:
+        return False
+    with open(meta_path + '.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        meta = read_json(meta_path) or {}
+        if meta.get('src') != src or meta.get('offset', 0) > size or meta.get('version') != VERSION:
+            meta = {'version': VERSION, 'src': src, 'offset': 0, 'lines': 0, 'you_chars': 0, 'compactions': 0, 'days': {}}
+            open(txt, 'w').close()
+            open(refs_path, 'w').close()
+        with open(src, 'rb') as f:
+            f.seek(meta['offset'])
+            data = f.read()
+        end = data.rfind(b'\n') + 1
+        out, refs = [], []
+        for raw in data[:end].split(b'\n'):
+            if not raw.strip():
+                continue
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                continue
+            line0 = meta['lines'] + len(out) + 1
+            lines = convert(record, meta, line0, refs)
+            for i, line in enumerate(lines):
+                if line.startswith(('you: ', 'claude: ')) and '://' in line:
+                    op = 'pasted' if line.startswith('you') else 'cited'
+                    titles = meta.get('titles', {})
+                    refs += [(line0 + i, meta.get('compactions', 0), op, kind, key, titles.get(key, '')) for kind, key in url_refs(line)]
+            out += lines
+        if out:
+            with open(txt, 'a') as f:
+                f.write('\n'.join(out) + '\n')
+        if refs:
+            with open(refs_path, 'a') as f:
+                f.write(''.join('\t'.join(str(x).replace('\t', ' ').replace('\n', ' ') for x in row) + '\n' for row in refs))
+        meta['offset'] += end
+        meta['lines'] += len(out)
+        meta['id'] = session_id
+        write_text(meta_path, json.dumps(meta))
+    return True
+
+
+def find_source(session_id):
+    hits = glob.glob(os.path.join(PROJECTS, '*', session_id + '.jsonl'))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def lineage():
+    parents = {}
+    try:
+        with open(LINEAGE) as f:
+            for row in f:
+                child, _, parent = row.strip().partition('\t')
+                if child and parent:
+                    parents[child] = parent
+    except OSError:
+        pass
+    return parents
+
+
+def all_meta():
+    metas = (read_json(p) for p in glob.glob(os.path.join(SESSIONS, '*.meta')))
+    return [m for m in metas if m and m.get('lines')]
+
+
+def title(m):
+    return m.get('title_custom') or m.get('title_ai') or m.get('first_msg') or m['id']
+
+
+def is_headless(m):
+    return m.get('entry') == 'sdk-cli'
+
+
+def write_index():
+    parents = lineage()
+    out = ['id\tlast\tfirst\tyou_chars\tlines\tcompactions\tprev\theadless\tcwd\ttitle']
+    for m in sorted(all_meta(), key=lambda m: m.get('last') or '', reverse=True):
+        out.append('\t'.join(str(x).replace('\t', ' ') for x in (
+            m['id'], (m.get('last') or '')[:16], (m.get('first') or '')[:16], m.get('you_chars', 0),
+            m.get('lines', 0), m.get('compactions', 0), parents.get(m['id'], ''), int(is_headless(m)),
+            m.get('cwd', ''), title(m))))
+    write_text(INDEX, '\n'.join(out) + '\n')
+
+
+def recent_interactive():
+    since = (datetime.now() - timedelta(days=WINDOW_DAYS)).strftime('%Y-%m-%d')
+    return [m for m in all_meta() if not is_headless(m) and any(d >= since for d in m.get('days', {}))]
+
+
+def cmd_sync(ids):
+    os.makedirs(SESSIONS, exist_ok=True)
+    sources = [find_source(i) for i in ids] if ids else glob.glob(os.path.join(PROJECTS, '*', '*.jsonl'))
+    changed = sum(sync_one(s) for s in sources if s)
+    write_index()
+    print(f'{changed} updated')
+
+
+def cmd_link(child, parent):
+    os.makedirs(HOME, exist_ok=True)
+    if lineage().get(child) != parent:
+        with open(LINEAGE, 'a') as f:
+            f.write(f'{child}\t{parent}\n')
+    write_index()
+
+
+def cmd_areas_input():
+    since = (datetime.now() - timedelta(days=WINDOW_DAYS)).strftime('%Y-%m-%d')
+    for m in sorted(recent_interactive(), key=lambda m: m.get('last') or '', reverse=True):
+        hours = sum(v[1] for d, v in m.get('days', {}).items() if d >= since) / 60
+        if m.get('you_chars', 0) < 200:
+            continue
+        firsts = []
+        with open(os.path.join(SESSIONS, m['id'] + '.txt')) as f:
+            for line in f:
+                if re.match(r'you: \[\d\d-\d\d \d\d:\d\d\] ', line):
+                    firsts.append(one_line(line[19:], 220))
+                    if len(firsts) == 3:
+                        break
+        print(f"{m['id'][:8]} | {(m.get('last') or '')[:10]} | {os.path.basename(m.get('cwd', ''))} | "
+              f"{hours:.1f}h active | {m.get('you_chars', 0)} chars | {one_line(title(m), 70)} | {' / '.join(firsts)}")
+
+
+def cmd_areas():
+    """Attention per body of work: each signal (typed, active minutes, output tokens) is summed per area with a
+    recency decay, turned into the area's share, and the three shares are blended by geometric mean. Summing
+    first keeps attention additive in time; a raw product grows with the cube of a session's length."""
+    os.makedirs(VIEWS, exist_ok=True)
+    classified = read_json(os.path.join(VIEWS, 'areas.json'), {'areas': []})
+    by_prefix, status = {}, {}
+    for area in classified.get('areas', []):
+        status[area['name']] = area.get('status', '')
+        for prefix in area.get('sessions', []):
+            by_prefix[prefix[:8]] = area['name']
+
+    now = datetime.now()
+    since = (now - timedelta(days=WINDOW_DAYS)).strftime('%Y-%m-%d')
+    sessions = recent_interactive()
+    signal = {}
+    for m in sessions:
+        sums = [0.0, 0.0, 0.0]
+        for day, values in m.get('days', {}).items():
+            if day < since:
+                continue
+            age = (now - datetime.fromisoformat(day + 'T12:00:00')).total_seconds() / 86400
+            weight = 0.5 ** (max(age, 0) / HALF_LIFE_DAYS)
+            sums = [s + v * weight for s, v in zip(sums, values)]
+        signal[m['id']] = sums
+
+    def blend(groups):
+        totals = [sum(signal[i][k] for ids in groups.values() for i in ids) or 1 for k in range(3)]
+        raw = {}
+        for name, ids in groups.items():
+            shares = [sum(signal[i][k] for i in ids) / totals[k] for k in range(3)]
+            raw[name] = (shares[0] * shares[1] * shares[2]) ** (1 / 3)
+        whole = sum(raw.values()) or 1
+        return {name: value / whole for name, value in raw.items()}
+
+    groups = {}
+    for m in sessions:
+        groups.setdefault(by_prefix.get(m['id'][:8], MISC), []).append(m['id'])
+    scores = blend(groups)
+    folded = [n for n, s in scores.items() if n != MISC and s < MISC_BELOW]
+    for name in folded:
+        groups.setdefault(MISC, []).extend(groups.pop(name))
+    scores = blend(groups)
+    if folded:
+        status[MISC] = 'Also: ' + ', '.join(sorted(folded))
+
+    metas = {m['id']: m for m in sessions}
+    ranked = []
+    for name in sorted(groups, key=lambda n: (n == MISC, -scores[n])):
+        ids = sorted(groups[name], key=lambda i: metas[i].get('last') or '', reverse=True)
+        ranked.append({'name': name, 'share': round(scores[name], 3),
+                       'status': status.get(name, ''),
+                       'last': (metas[ids[0]].get('last') or '')[:10], 'sessions': ids})
+
+    md = [f'# Bodies of work, by attention (last {WINDOW_DAYS} days)', '',
+          'Attention blends what the user typed, active time and Claude\'s output, halving every '
+          f'{HALF_LIFE_DAYS} days; headless runs are excluded. Sessions are newest first. To pick up context, '
+          'search the sessions of the area that fits the task: rg -n "<term>" "$CC_SESSIONS/<id>.txt", '
+          'tail -n 300 "$CC_SESSIONS/<id>.txt".', '']
+    tsv = ['id\tarea\tlast\ttitle']
+    for area in ranked:
+        md += [f"## {area['name']} — {round(area['share'] * 100)}%, last active {area['last']}"]
+        if area['status']:
+            md.append(area['status'])
+        for i in area['sessions']:
+            m = metas[i]
+            md.append(f"- {i} {(m.get('last') or '')[:10]} {one_line(title(m), 70)} ({os.path.basename(m.get('cwd', ''))})")
+            tsv.append(f"{i}\t{area['name']}\t{(m.get('last') or '')[:16]}\t{one_line(title(m), 100)}")
+        md.append('')
+    write_text(os.path.join(VIEWS, 'areas.md'), '\n'.join(md))
+    write_text(os.path.join(VIEWS, 'areas.tsv'), '\n'.join(tsv) + '\n')
+    print(json.dumps([{k: a[k] for k in ('name', 'share', 'last', 'sessions')} for a in ranked]))
+
+
+def tool_group(name):
+    if name.startswith('mcp__'):
+        server = name.split('__')[1].replace('claude_ai_', '')
+        # Connectors registered under a UUID say what they are only in the tool's own name (notion-fetch, slack_read_thread).
+        if re.fullmatch(r'[0-9a-f-]{36}', server):
+            server = re.split(r'[-_]', name.split('__')[-1])[0]
+        return server.replace('_', ' ')
+    return {'Bash': 'shell', 'Read': 'read', 'Edit': 'edit', 'Write': 'edit', 'NotebookEdit': 'edit',
+            'Grep': 'search', 'Glob': 'search'}.get(name, name)
+
+
+def scaffold(lines):
+    """The user's asks by line, each with how the turn ended: its tool calls and the first line of Claude's last reply.
+    The newest turns are shown whole, older asks alone, and the oldest are counted, apart from the first ask."""
+    turns, marks, prev = [], [], ''
+    for n, line in enumerate(lines, 1):
+        m = ASK.match(line)
+        if m and not re.fullmatch(r'/\S+', m.group(2).strip()):
+            turns.append({'line': n, 'ask': m.group(2), 'tools': {}, 'reply': None})
+        elif line.startswith('--- compacted'):
+            marks.append(n)
+        elif turns and line.startswith('tool: '):
+            group = tool_group(line[6:].split(':', 1)[0])
+            turns[-1]['tools'][group] = turns[-1]['tools'].get(group, 0) + 1
+        elif turns and line.startswith('claude: ') and prev != 'claude' and line[8:].strip():
+            turns[-1]['reply'] = (n, line[8:])
+        prev = line.split(':', 1)[0]
+
+    def ask_row(t):
+        return f"L{t['line']:<6}you: {one_line(t['ask'], 100)}"
+
+    def reply_row(t):
+        count = sum(t['tools'].values())
+        if not count and not t['reply']:
+            return None
+        top = sorted(t['tools'].items(), key=lambda kv: -kv[1])
+        tools = ', '.join(f'{k} {v}' if v > 1 else k for k, v in top[:4]) + (f' +{len(top) - 4}' if len(top) > 4 else '')
+        lead = f"[{count} tool{'s' if count > 1 else ''}: {tools}] " if count else ''
+        line, text = t['reply'] or (t['line'] + 1, '')
+        return f"L{line:<6}claude: {lead}{one_line(text.replace('**', '').lstrip('# '), 100)}"
+
+    shown, used, skipped = {}, 0, []
+    for i in range(len(turns) - 1, -1, -1):
+        t = turns[i]
+        rows = [ask_row(t)]
+        if used < SCAFFOLD_FULL_CHARS:
+            rows += [r for r in [reply_row(t)] if r]
+        cost = sum(len(r) + 1 for r in rows)
+        if i == 0 or used + cost <= SCAFFOLD_FULL_CHARS + SCAFFOLD_ASK_CHARS:
+            shown[i] = rows
+            used += cost
+        else:
+            skipped.append(i)
+    out, last = [], 0
+    for i, t in enumerate(turns):
+        if i not in shown:
+            continue
+        gap = [j for j in skipped if last <= j < i]
+        out += [f'L{n:<6}--- compacted ---' for n in marks if (turns[i - 1]['line'] if i else 0) < n < t['line']]
+        if gap:
+            out.append(f"…      {len(gap)} asks, L{turns[gap[0]]['line']}–L{turns[gap[-1]]['line']}")
+        out += shown[i]
+        last = i
+    out += [f'L{n:<6}--- compacted ---' for n in marks if turns and n > turns[-1]['line']]
+    return '\n'.join(out), len(turns)
+
+
+def short_path(path):
+    home = os.path.expanduser('~')
+    return '~' + path[len(home):] if path.startswith(home) else path
+
+
+def refs_in_play(session_id, epoch):
+    """References weighted by what was done with them in each compaction segment, halving per compaction since; files
+    rolled up by folder."""
+    agg = {}
+    try:
+        with open(os.path.join(SESSIONS, session_id + '.refs.tsv')) as f:
+            rows = [r.rstrip('\n').split('\t') for r in f]
+    except OSError:
+        rows = []
+    for row in rows:
+        if len(row) != 6 or row[2] not in OP_WEIGHT:
+            continue
+        line, at, op, kind, key, title = int(row[0]), int(row[1]), row[2], row[3], row[4], row[5]
+        a = agg.setdefault((kind, key), {'by': {}, 'n': 0, 'first': line, 'last': line, 'title': '', 'ops': set()})
+        a['by'][at] = max(a['by'].get(at, 0), OP_WEIGHT[op])
+        a['n'] += 1
+        a['last'] = line
+        a['title'] = title or a['title']
+        a['ops'].add(op)
+    # `gh pr view 248` names no repo; fold it into the one full key with that number, when there is exactly one.
+    for kind, key in [k for k in agg if k[0] == 'github' and k[1].startswith('#')]:
+        full = [k for k in agg if k[0] == 'github' and k[1].endswith(key) and k[1] != key]
+        if len(full) == 1:
+            a, b = agg.pop((kind, key)), agg[full[0]]
+            b.update(by={at: max(a['by'].get(at, 0), b['by'].get(at, 0)) for at in a['by'].keys() | b['by'].keys()}, n=a['n'] + b['n'], first=min(a['first'], b['first']),
+                     last=max(a['last'], b['last']), title=b['title'] or a['title'], ops=a['ops'] | b['ops'])
+    for a in agg.values():
+        a['score'] = sum(w * 0.5 ** max(epoch - at, 0) for at, w in a['by'].items())
+    live = {k: a for k, a in agg.items() if a['score'] >= REFS_FLOOR}
+
+    def span(a):
+        return f"L{a['first']}" + (f"–L{a['last']}" if a['last'] != a['first'] else '') + (f" ×{a['n']}" if a['n'] > 1 else '')
+
+    rows = []
+    others = sorted(((k, a) for k, a in live.items() if k[0] != 'file'), key=lambda kv: -kv[1]['score'])
+    for (kind, key), a in others[:REFS_SHOWN]:
+        made = ' (made)' if 'made' in a['ops'] else ' (edited)' if 'edit' in a['ops'] else ''
+        label = f"{a['title']}  {key}" if a['title'] else key
+        rows.append(f"  {kind:<9}{label}{made}  {span(a)}")
+    dirs = {}
+    for (kind, key), a in live.items():
+        if kind == 'file':
+            dirs.setdefault(os.path.dirname(key), []).append((key, a))
+    ranked = sorted(dirs.items(), key=lambda kv: -sum(a['score'] for _, a in kv[1]))
+    for folder, files in ranked[:DIRS_SHOWN]:
+        edited = [os.path.basename(k) for k, a in sorted(files, key=lambda kv: -kv[1]['score']) if 'edit' in a['ops']]
+        reads = [k for k, a in files if 'edit' not in a['ops']]
+        what = []
+        if edited:
+            what.append('edited ' + ', '.join(edited[:4]) + (f' +{len(edited) - 4}' if len(edited) > 4 else ''))
+        if reads:
+            what.append(f'read {len(reads)}' if len(reads) > 1 else f'read {os.path.basename(reads[0])}')
+        first, last = min(a['first'] for _, a in files), max(a['last'] for _, a in files)
+        where = f'L{first}' + (f'–L{last}' if last != first else '')
+        if len(files) == 1 and not edited:
+            rows.append(f"  {'file':<9}{short_path(files[0][0])}  {where}")
+        else:
+            rows.append(f"  {'files':<9}{short_path(folder)}/  {'; '.join(what)}  {where}")
+    hidden = len(others) - REFS_SHOWN + max(len(ranked) - DIRS_SHOWN, 0)
+    if hidden > 0:
+        rows.append(f'  … {hidden} more in play')
+    return '\n'.join(rows), rows[:5]
+
+
+def cmd_handoff(session_id):
+    """For a compaction or a /clear: the scaffold, the references in play, the asks by line, and the last exchange
+    (for a compaction mid-task), cut to its final lines when it is long."""
+    with open(os.path.join(SESSIONS, session_id + '.txt')) as f:
+        lines = f.read().split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()
+    meta = read_json(os.path.join(SESSIONS, session_id + '.meta'), {})
+    asks = []
+    for n, line in enumerate(lines, 1):
+        m = ASK.match(line)
+        if m and not re.fullmatch(r'/\S+', m.group(2).strip()):
+            asks.append({'line': n, 'at': m.group(1), 'text': one_line(m.group(2), 110)})
+    outline, total = scaffold(lines)
+    refs, top = refs_in_play(session_id, meta.get('compactions', 0))
+    start = max(asks[-1]['line'] if asks else 1, len(lines) - HANDOFF_TAIL_LINES + 1, 1)
+    tail = '\n'.join(lines[start - 1:])
+    if len(tail) > HANDOFF_TAIL_CHARS:
+        tail = '…' + tail[-HANDOFF_TAIL_CHARS:]
+    area = ''
+    try:
+        with open(os.path.join(VIEWS, 'areas.tsv')) as f:
+            area = next((row.split('\t')[1] for row in f if row.startswith(session_id + '\t')), '')
+    except OSError:
+        pass
+    print(json.dumps({'lines': len(lines), 'asks': asks[-3:], 'asksTotal': total, 'scaffold': outline, 'refs': refs,
+                      'refsTop': '\n'.join(top), 'tailStart': start, 'tail': tail, 'area': area,
+                      'title': title(meta) if meta.get('id') else ''}))
+
+
+def main(argv):
+    commands = {
+        'sync': lambda a: cmd_sync(a),
+        'link': lambda a: cmd_link(*a) if len(a) == 2 else None,
+        'areas-input': lambda a: cmd_areas_input(),
+        'areas': lambda a: cmd_areas(),
+        'handoff': lambda a: cmd_handoff(a[0]) if len(a) == 1 else None,
+    }
+    if not argv or argv[0] not in commands:
+        print(__doc__)
+        return 2
+    commands[argv[0]](argv[1:])
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
