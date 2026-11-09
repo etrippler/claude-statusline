@@ -1,92 +1,54 @@
 # session-helper
 
-A Claude Code mod that gives every session cheap access to every other session. Claude reads past work with `rg`, `sed` and `tail` instead of parsing raw jsonl, and starts each conversation knowing what you've been working on.
+A Claude Code mod that keeps a plain-text copy of every session, groups recent sessions into bodies of work, and tells each new conversation where to find them. Claude reads past work with `rg`, `sed` and `tail` instead of parsing raw jsonl.
 
-## What it changes in Claude Code
+## Hooks
 
-- **Session start:** a `bodiesOfWork` block in the first message, ranking your recent bodies of work, e.g. `- On-call week 12%: handoffs, tickets, runbooks moved into the repo`.
-- **Bash environment:** `$CC_HOME`, `$CC_SESSIONS`, `$CC_INDEX`, `$CC_VIEWS` and `$CC_SESSION`, pointing at the text copies.
-- **After `/clear`:** a `previousSession` block with the cleared session's last asks and top references, and `$CC_PREV_SESSION` pointing at its transcript.
-- **After a compaction:** `bodiesOfWork` again.
-- **Slash commands:** `/areas`, to regroup the bodies of work now.
-- **CLAUDE.md:** nothing; the section you paste in (see Install) is what tells Claude to use the files.
-
-## What it does
-
-- **Plain-text transcripts.** Every session gets a copy at `$CC_SESSIONS/<id>.txt`, synced after each turn. Every line starts with its role (`you:`, `claude:`, `tool:`, `result:`, `note:`), and line numbers never change, so `file:line` pointers stay valid.
-- **References.** Beside each copy, `<id>.refs.tsv` lists the Slack threads, PRs, Linear issues, Notion pages, Granola meetings, artifacts and files the session used, with titles. Keys are normalized, so `rg TRA-2448 $CC_SESSIONS/*.refs.tsv` finds every session that touched one.
-- **Bodies of work.** At most once an hour, Sonnet groups the last three weeks of sessions into 4–8 bodies of work. They're ranked locally by typing, active time and output, and the ranking goes into each session's first message.
-- **`/clear` pointer.** After a `/clear`, the new conversation gets the cleared session's last asks and what it was using, and `$CC_PREV_SESSION` points at its transcript.
-
-Prompts, tool calls, permissions and compaction are left to the engine; the mod's only other effect is background work. Headless runs (`-p`, SDK scripts) get the env vars and transcripts but no blocks or model calls. A custom compaction built from the text copy lived here until Nov 2026; it's in this repo's history in the commit that imported the mod.
-
-## How it fits together
-
-```mermaid
-flowchart LR
-  subgraph cc[Claude Code]
-    jsonl[projects/&lt;id&gt;.jsonl]
-    start[session.start · /areas]
-    turn[turn.complete]
-    submit[prompt.submit]
-    ctx[prompt.context]
-  end
-  subgraph mod[session-helper]
-    refresh["refresh()"]
-    ensure["ensureSession()"]
-  end
-  subgraph work[workers]
-    sync[cc-text sync]
-    sonnet[Sonnet: group sessions]
-    rank[cc-text areas]
-  end
-  subgraph files[~/.claude/session-helper]
-    txt[sessions/&lt;id&gt;.txt + .refs.tsv]
-    index[index.tsv]
-    views[views/areas.md]
-  end
-  jsonl -- new bytes --> sync
-  start --> refresh
-  refresh -- 1 --> sync
-  refresh -- "2 if >1h" --> sonnet
-  refresh -- 3 --> rank
-  turn -- this session --> sync
-  sync --> txt & index
-  sonnet --> views
-  rank --> views
-  submit --> ensure
-  ensure -- "$CC_* env" --> claude[Claude, via Bash]
-  ctx -- "bodiesOfWork · previousSession" --> claude
-  claude -- rg · tail · cat --> files
-```
-
-## When each part runs
-
-| When | What | Cost |
+| Hook | Fires | What the mod does |
 | --- | --- | --- |
-| Interactive session starts | Sync all transcripts; regroup if `areas.json` is over an hour old; rank | ≤1 Sonnet call an hour |
-| `/areas` | Same, always regroups | 1 Sonnet call |
-| Every turn (main loop, not subagents) | Sync this session's text copy and refs | local, incremental |
-| Every prompt | Follow the session id; after `/clear`, repoint `$CC_*` and set `$CC_PREV_SESSION` | local |
-| First message, and again after a compaction | Add the `bodiesOfWork` block, plus `previousSession` after a `/clear` | local |
-| Headless runs (`-p`, SDK scripts) | Env vars and transcript only; left out of the ranking | none |
+| `session.start` | A session begins | Sets the `$CC_*` env vars. Interactive sessions also register `/areas` and run a refresh in the background: sync all transcripts, regroup if the last grouping is over an hour old, rank. |
+| `prompt.submit` | Each prompt you send | Follows the session id. After a `/clear`, repoints `$CC_*`, sets `$CC_PREV_SESSION` and records the lineage. |
+| `prompt.context` | Once per conversation, when the first message's context blocks are built; again after a compaction or `/clear` | Adds `bodiesOfWork`, plus `previousSession` after a `/clear`. Interactive sessions only. |
+| `turn.complete` | A main-loop turn ends (not a subagent's) | Syncs this session's text copy and refs. |
+| `session.compact` | `/compact` or auto-compaction | Nothing beyond noting it, so `previousSession` isn't sent again; the engine compacts as usual. |
+| `session.end` | A session ends, including by `/clear` | Remembers a cleared session's id for the next conversation. |
+| `command.run` | `/areas` | Runs the refresh with a forced regroup. |
 
-The desktop app and the VS Code extension drive the engine over the SDK but count as interactive.
+Headless runs (`-p`, SDK scripts) get the env vars and transcript syncs only. The desktop app and VS Code count as interactive.
 
-## Files and env vars
+## What Claude sees
 
-Everything lives under `$CC_HOME` (default `~/.claude/session-helper`):
+- **`bodiesOfWork`** context block, one line per body of work: `- On-call week 12%: handoffs, tickets, runbooks moved into the repo`, plus a pointer to `$CC_VIEWS/areas.md`.
+- **`previousSession`** context block, after a `/clear`: the cleared session's id, length and body of work, its last three asks by line, and its top references.
+- **Env vars** in every Bash call: `$CC_HOME`, `$CC_SESSIONS`, `$CC_INDEX`, `$CC_VIEWS`, `$CC_SESSION`, and `$CC_PREV_SESSION` after a `/clear`.
+- **`/areas`** slash command.
+
+Nothing goes into CLAUDE.md or the system prompt; the section you paste in (see Install) is what tells Claude when to read the files.
+
+## What it runs
+
+| Command | Called from | Does |
+| --- | --- | --- |
+| `cc-text sync [ID …]` | refresh (all), `turn.complete` (this session) | Converts new transcript lines to text from a saved offset, and records references and per-day attention. |
+| `cc-text areas-input` → Sonnet | refresh, at most hourly; `/areas` | One `$.model.complete` call that groups the last 21 days of interactive sessions into 4–8 bodies of work, keeping earlier names where they fit. |
+| `cc-text areas` | refresh | Ranks bodies of work by typing, active time and output (4-day half-life) and folds those under 4% into Misc. No model call. |
+| `cc-text previous ID` | `prompt.context` after a `/clear` | Prints what the `previousSession` block shows. |
+| `cc-text link CHILD PARENT` | `prompt.submit` after a `/clear` | Records the lineage. |
+
+`cc-text` is Python 3 with no dependencies; run it with no arguments for usage.
+
+## Files
+
+Under `$CC_HOME` (default `~/.claude/session-helper`):
 
 | Path | Env var | Holds |
 | --- | --- | --- |
-| `sessions/<id>.txt` | `$CC_SESSION` (this one), `$CC_SESSIONS` (the folder) | One plain-text copy per session |
-| `sessions/<id>.refs.tsv` | | line, compaction, op, kind, key, title |
-| `sessions/<id>.meta` | | Sync offset and per-day attention |
-| `index.tsv` | `$CC_INDEX` | One row per session, newest first |
-| `lineage.tsv` | | child, parent; one row per `/clear` |
-| `views/areas.md` | `$CC_VIEWS` | Bodies of work ranked, sessions newest first; `areas.tsv` and `areas.json` beside it |
-
-`views/` is derived and safe to delete. `cc-text` (Python 3, no dependencies) does the file work; run it with no arguments for its commands.
+| `sessions/<id>.txt` | `$CC_SESSION` (this one), `$CC_SESSIONS` (the folder) | One copy per session. Each line starts with its role (`you:`, `claude:`, `tool:`, `result:`, `note:`); line numbers never change. |
+| `sessions/<id>.refs.tsv` | | Every Slack thread, PR, Linear issue, Notion page, Granola meeting, artifact and file the session used: line, compaction, op, kind, key, title. Keys are normalized, so `rg TRA-2448 $CC_SESSIONS/*.refs.tsv` finds every session that touched one. |
+| `sessions/<id>.meta` | | Sync offset and per-day attention. |
+| `index.tsv` | `$CC_INDEX` | One row per session, newest first. |
+| `lineage.tsv` | | child, parent; one row per `/clear`. |
+| `views/areas.md` | `$CC_VIEWS` | Bodies of work ranked, each with its sessions newest first. `areas.json` (Sonnet's grouping) and `areas.tsv` sit beside it; `views/` is safe to delete. |
 
 ## Install
 
@@ -135,3 +97,7 @@ The first interactive session syncs every existing transcript, which takes a whi
 - Edits made through Bash (`sed -i`, here-docs, scripts) count as reads, not edits. Only Edit, Write and NotebookEdit register as edits.
 - A new session isn't in any body of work until the next regroup, up to an hour later.
 - Repo-less `gh pr view 248` folds into the full PR key only when the session also has that PR's URL; otherwise it shows as `#248`.
+
+## History
+
+This was the `threads` mod. Its custom compaction, built from the text copy instead of the engine's summarizer, is in this repo's history in the commit that imported it.
