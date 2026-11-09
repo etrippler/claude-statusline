@@ -97,7 +97,3 @@ The first interactive session syncs every existing transcript, which takes a whi
 - Edits made through Bash (`sed -i`, here-docs, scripts) count as reads, not edits. Only Edit, Write and NotebookEdit register as edits.
 - A new session isn't in any body of work until the next regroup, up to an hour later.
 - Repo-less `gh pr view 248` folds into the full PR key only when the session also has that PR's URL; otherwise it shows as `#248`.
-
-## History
-
-This was the `threads` mod. Its custom compaction, built from the text copy instead of the engine's summarizer, is in this repo's history in the commit that imported it.
