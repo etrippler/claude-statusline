@@ -11,12 +11,14 @@ A Claude Code mod that gives every session cheap access to every other session. 
 - **Slash commands:** `/areas`, to regroup the bodies of work now.
 - **CLAUDE.md:** nothing; the section you paste in (see Install) is what tells Claude to use the files.
 
+## What it does
+
 - **Plain-text transcripts.** Every session gets a copy at `$CC_SESSIONS/<id>.txt`, synced after each turn. Every line starts with its role (`you:`, `claude:`, `tool:`, `result:`, `note:`), and line numbers never change, so `file:line` pointers stay valid.
 - **References.** Beside each copy, `<id>.refs.tsv` lists the Slack threads, PRs, Linear issues, Notion pages, Granola meetings, artifacts and files the session used, with titles. Keys are normalized, so `rg TRA-2448 $CC_SESSIONS/*.refs.tsv` finds every session that touched one.
 - **Bodies of work.** At most once an hour, Sonnet groups the last three weeks of sessions into 4–8 bodies of work. They're ranked locally by typing, active time and output, and the ranking goes into each session's first message.
 - **`/clear` pointer.** After a `/clear`, the new conversation gets the cleared session's last asks and what it was using, and `$CC_PREV_SESSION` points at its transcript.
 
-Prompts, tool calls, permissions and compaction are left to the engine; the mod's only other effect is background work. A custom compaction built from the text copy lived here until Nov 2026; it's in this repo's history in the commit that imported the mod.
+Prompts, tool calls, permissions and compaction are left to the engine; the mod's only other effect is background work. Headless runs (`-p`, SDK scripts) get the env vars and transcripts but no blocks or model calls. A custom compaction built from the text copy lived here until Nov 2026; it's in this repo's history in the commit that imported the mod.
 
 ## How it fits together
 
