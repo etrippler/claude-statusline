@@ -14,7 +14,7 @@ cargo build --release && target/release/statusline install
 Or a prebuilt binary, put at `~/.claude/statusline` (`$STATUSLINE_DIR` to relocate):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/etrippler/claude-statusline/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/etrippler/claude-statusline/main/statusline/install.sh | sh
 ```
 
 - `install` points `statusLine` and `subagentStatusLine` in `~/.claude/settings.json` at the binary.

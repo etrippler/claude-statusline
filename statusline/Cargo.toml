@@ -1,0 +1,15 @@
+[package]
+name = "claude-statusline"
+version = "0.1.0"
+edition = "2024"
+description = "Claude Code status lines — main session line + subagent rows (Rust port of statusline.py)"
+publish = false
+
+[[bin]]
+name = "statusline"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }

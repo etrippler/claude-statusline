@@ -37,9 +37,10 @@ pub fn now() -> f64 {
 // --------------------------------------------------------------------- update
 
 /// The repo this binary was built in, when it's running from there: a clone
-/// updates through git, not releases.
+/// updates through git, not releases. The package sits one level below the
+/// workspace root, which holds `.git` and `target/`.
 fn checkout() -> Option<&'static Path> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
     (self_path().starts_with(root) && root.join(".git").exists()).then_some(root)
 }
 

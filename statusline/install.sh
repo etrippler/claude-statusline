@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install the statusline binary and point Claude Code at it:
-#   curl -fsSL https://raw.githubusercontent.com/etrippler/claude-statusline/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/etrippler/claude-statusline/main/statusline/install.sh | sh
 # Arguments pass through to `statusline install` (e.g. a project's .claude/settings.json):
 #   curl -fsSL …/install.sh | sh -s -- path/to/.claude/settings.json
 set -eu
