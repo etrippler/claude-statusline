@@ -6,7 +6,7 @@ A Claude Code mod that keeps a plain-text copy of every session, groups recent s
 
 | Hook | Fires | What the mod does |
 | --- | --- | --- |
-| `session.start` | A session begins | Sets the `$CC_*` env vars. Interactive sessions also register `/areas` and run a refresh in the background: sync all transcripts, regroup if the last grouping is over an hour old, rank. |
+| `session.start` | A session begins | Sets the `$CC_*` env vars. Interactive sessions also register `/areas` and run a refresh in the background: sync all transcripts, regroup if the last grouping is over a day old, rank. |
 | `prompt.submit` | Each prompt you send | Follows the session id. After a `/clear`, repoints `$CC_*`, sets `$CC_PREV_SESSION` and records the lineage. |
 | `prompt.context` | Once per conversation, when the first message's context blocks are built; again after a compaction or `/clear` | Adds `bodiesOfWork`, plus `previousSession` after a `/clear`. Interactive sessions only. |
 | `turn.complete` | A main-loop turn ends (not a subagent's) | Syncs this session's text copy and refs. |
@@ -18,7 +18,7 @@ Headless runs (`-p`, SDK scripts) get the env vars and transcript syncs only. Th
 
 ## What Claude sees
 
-- **`bodiesOfWork`** context block, one line per body of work: `- On-call week 12%: handoffs, tickets, runbooks moved into the repo`, plus a pointer to `$CC_VIEWS/areas.md`.
+- **`bodiesOfWork`** context block, one line per body of work: `- On-call week 12%: handoffs, tickets, runbooks moved into the repo`, plus a pointer to `$CC_VIEWS/areas.md`. Left out when there are fewer than three bodies of work besides Misc.
 - **`previousSession`** context block, after a `/clear`: the cleared session's id, length and body of work, its last three asks by line, and its top references.
 - **Env vars** in every Bash call: `$CC_HOME`, `$CC_SESSIONS`, `$CC_INDEX`, `$CC_VIEWS`, `$CC_SESSION`, and `$CC_PREV_SESSION` after a `/clear`.
 - **`/areas`** slash command.
@@ -30,7 +30,7 @@ Nothing goes into CLAUDE.md or the system prompt; the section you paste in (see 
 | Command | Called from | Does |
 | --- | --- | --- |
 | `cc-text sync [ID …]` | refresh (all), `turn.complete` (this session) | Converts new transcript lines to text from a saved offset, and records references and per-day attention. |
-| `cc-text areas-input` → Sonnet | refresh, at most hourly; `/areas` | One `$.model.complete` call that groups the last 21 days of interactive sessions into 4–8 bodies of work, keeping earlier names where they fit. |
+| `cc-text areas-input` → Sonnet | refresh, at most daily; `/areas` | One `$.model.complete` call that groups the last 21 days of interactive sessions into 4–8 bodies of work, keeping earlier names where they fit. |
 | `cc-text areas` | refresh | Ranks bodies of work by typing, active time and output (4-day half-life) and folds those under 4% into Misc. No model call. |
 | `cc-text previous ID` | `prompt.context` after a `/clear` | Prints what the `previousSession` block shows. |
 | `cc-text link CHILD PARENT` | `prompt.submit` after a `/clear` | Records the lineage. |
@@ -95,5 +95,5 @@ The first interactive session syncs every existing transcript, which takes a whi
 ## Known gaps
 
 - Edits made through Bash (`sed -i`, here-docs, scripts) count as reads, not edits. Only Edit, Write and NotebookEdit register as edits.
-- A new session isn't in any body of work until the next regroup, up to an hour later.
+- A new session isn't in any body of work until the next regroup, up to a day later; `/areas` regroups now.
 - Repo-less `gh pr view 248` folds into the full PR key only when the session also has that PR's URL; otherwise it shows as `#248`.

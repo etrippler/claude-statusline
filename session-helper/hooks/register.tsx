@@ -3,7 +3,9 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { Area } from '../types'
 
-const STALE_MS = 60 * 60 * 1000
+const STALE_MS = 24 * 60 * 60 * 1000
+// Fewer distinct bodies of work than this and the block says little the cwd doesn't, so it's left out.
+const MIN_AREAS = 3
 // Change the tag when Area's fields change: it declines what an earlier version stored.
 const areas = atom({ plugin: 'session-helper', key: 'areas' } as const, [], { shape: 'areas-3' })
 
@@ -130,6 +132,7 @@ async function areasBlock($: EngineInterface) {
   const rows = list
     .filter(area => area.name !== 'Misc')
     .map(area => `- ${area.name} ${Math.round(area.share * 100)}%: ${status.get(area.name) ?? ''}`.trimEnd())
+  if (rows.length < MIN_AREAS) return undefined
 
   return `The user's current bodies of work, ranked by attention over the last 21 days. Each one's sessions, newest first, are in $CC_VIEWS/areas.md.\n${rows.join('\n')}`
 }
