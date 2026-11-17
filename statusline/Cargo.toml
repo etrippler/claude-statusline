@@ -2,7 +2,7 @@
 name = "claude-statusline"
 version = "0.1.0"
 edition = "2024"
-description = "Claude Code status lines — main session line + subagent rows (Rust port of statusline.py)"
+description = "Claude Code main status line (Rust port of statusline.py)"
 publish = false
 
 [[bin]]

@@ -1,9 +1,8 @@
-//! Claude Code status lines — main session line + subagent rows — in one
-//! binary. `statusline --help` for commands.
+//! Claude Code's main status line in one binary. `statusline --help` for
+//! commands. Subagent rows are the `agent-rows` mod's.
 //!
 //! The branch glyph is Powerline (U+E0A0): use a Powerline-capable font.
 
-mod agents;
 mod ansi;
 mod ci;
 mod fmt;
@@ -90,7 +89,6 @@ fn usage() -> String {
 
 usage: statusline [command]     (no command: render the main line; JSON on stdin)
 
-  subagent      render subagent task rows (JSON on stdin)
   toggles       list the segments and whether each is on
   on|off KEY    flip a segment persistently
   update        a clone: git pull + cargo build; otherwise: download the latest release
@@ -132,10 +130,9 @@ fn install(target: Option<&str>) -> Result<(), String> {
     let mut settings: Map<String, Value> = read_json(&path);
     settings
         .insert("statusLine".into(), json!({"type": "command", "command": cmd, "padding": 0, "refreshInterval": 1}));
-    settings.insert("subagentStatusLine".into(), json!({"type": "command", "command": format!("{cmd} subagent")}));
     let body = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())? + "\n";
     write_atomic(&path, &body).map_err(fail)?;
-    println!("{} statusLine + subagentStatusLine → {cmd}", path.display());
+    println!("{} statusLine → {cmd}", path.display());
     Ok(())
 }
 
@@ -168,11 +165,6 @@ fn run(args: &[&str]) -> Result<(), String> {
         ["on" | "off"] => return Err("usage: statusline on|off KEY".into()),
         [REFRESH_PR, branch, owner, name, ..] => ci::refresh(branch, owner, name),
         [REFRESH_DIFF, cwd, ..] => git::refresh_diff(Path::new(cwd)),
-        ["subagent", ..] => {
-            for row in agents::render(&read_stdin()?) {
-                println!("{row}");
-            }
-        }
         _ => println!("{}", line::render(&read_stdin()?, &Toggles::load())),
     }
     Ok(())

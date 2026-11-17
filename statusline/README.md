@@ -1,6 +1,6 @@
 # claude-statusline
 
-Claude Code status lines — main session line + subagent rows — in one Rust binary. A render takes ~5ms and usually spawns no processes, so a 1s `refreshInterval` is cheap.
+Claude Code's main status line in one Rust binary. A render takes ~5ms and usually spawns no processes, so a 1s `refreshInterval` is cheap.
 
 ## Install
 
@@ -17,7 +17,7 @@ Or a prebuilt binary, put at `~/.claude/statusline` (`$STATUSLINE_DIR` to reloca
 curl -fsSL https://raw.githubusercontent.com/etrippler/claude-statusline/main/statusline/install.sh | sh
 ```
 
-- `install` points `statusLine` and `subagentStatusLine` in `~/.claude/settings.json` at the binary.
+- `install` points `statusLine` in `~/.claude/settings.json` at the binary.
 - `install PATH` targets another settings file instead — e.g. `project/.claude/settings.local.json`. Through the script: `sh -s -- PATH`.
 
 ## Configure

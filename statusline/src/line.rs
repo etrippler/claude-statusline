@@ -9,7 +9,7 @@ use crate::{
     model::Effort,
     now,
     settings::{Settings, Toggle, Toggles},
-    store::{Cache, Session},
+    store::Cache,
 };
 use serde::Deserialize;
 use std::{env, path::PathBuf};
@@ -122,9 +122,6 @@ pub fn render(input: &Input, on: &Toggles) -> String {
     let ws = &input.workspace;
     let cwd = ws.current_dir.clone().unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project = ws.project_dir.as_ref().unwrap_or(&cwd);
-    if let Some(id) = &input.session_id {
-        Session { model: input.model.id.clone(), effort: input.effort.level.clone() }.save(id);
-    }
     let mut cache = Cache::load();
     let git = git::status(&cwd, &mut cache);
     let repo = ws.repo.as_ref().filter(|r| !r.host.is_empty() && !r.owner.is_empty());

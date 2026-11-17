@@ -1,7 +1,7 @@
 //! Our own toggles, and the slice of Claude Code's settings cascade we read.
 
 use crate::{
-    model::{self, Effort},
+    model,
     store::{read_json, write_json},
 };
 use serde::Deserialize;
@@ -132,10 +132,6 @@ impl Settings {
             .max_by_key(|(k, _)| k.len())
             .map(|(_, v)| v)
             .or_else(|| self.merged.get(key).filter(set))
-    }
-
-    pub fn effort(&self, model: &str) -> Option<Effort> {
-        self.get("effortLevel", model).and_then(|v| Effort::deserialize(v).ok())
     }
 
     /// Token count where autocompact kicks in, or None when it's off or sits at the window.

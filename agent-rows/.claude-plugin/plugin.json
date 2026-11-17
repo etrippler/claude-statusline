@@ -1,0 +1,5 @@
+{
+  "name": "agent-rows",
+  "version": "0.1.0",
+  "description": "Subagent rows under the prompt that name each agent's type, model and effort"
+}

@@ -1,8 +1,7 @@
 //! What this binary keeps between runs, all in /tmp: a stale-while-revalidate
-//! cache for the slow lookups, and the session handoff from the main line to
-//! the subagent rows.
+//! cache for the slow lookups.
 
-use crate::{ci::Pr, git::Tracking, model::Effort, now, proc::spawn_detached};
+use crate::{ci::Pr, git::Tracking, now, proc::spawn_detached};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::HashMap,
@@ -185,34 +184,5 @@ impl Cache {
         let mut e = Entries::default();
         e.diff.insert(diff_key(top, branch), Entry { t: now(), v: Some(diff) });
         Entries::merge(e);
-    }
-}
-
-/// Subagent rows carry no session model or effort; the main line has both,
-/// live (mid-session /model and /effort included), and leaves them here.
-#[derive(Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Session {
-    pub model: String,
-    pub effort: Option<Effort>,
-}
-
-impl Session {
-    fn path(id: &str) -> Option<PathBuf> {
-        let id: String = id.chars().filter(|c| c.is_alphanumeric() || matches!(c, '_' | '-')).collect();
-        (!id.is_empty()).then(|| tmp(&format!("session-{id}.json")))
-    }
-
-    pub fn load(id: &str) -> Session {
-        Self::path(id).map(|p| read_json(&p)).unwrap_or_default()
-    }
-
-    /// Written only on change: most renders are no-ops.
-    pub fn save(&self, id: &str) {
-        if let Some(p) = Self::path(id)
-            && read_json::<Session>(&p) != *self
-        {
-            let _ = write_json(&p, self);
-        }
     }
 }
