@@ -72,6 +72,14 @@ pub struct Tracking {
     default_branch: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Remote {
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+}
+
 pub struct Status {
     /// The main checkout's directory name, shared by all its worktrees.
     pub name: String,
@@ -81,6 +89,7 @@ pub struct Status {
     pub default_branch: Option<String>,
     pub upstream: Option<Upstream>,
     pub diff: Option<Diff>,
+    pub remote: Option<Remote>,
 }
 
 struct Repo {
@@ -169,6 +178,47 @@ impl Repo {
         cache.set_tracking(key, t.clone());
         t
     }
+
+    fn origin_remote(&self) -> Option<Remote> {
+        let config = fs::read_to_string(self.common_dir.join("config")).ok()?;
+        let mut in_origin = false;
+        for line in config.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                in_origin = line == r#"[remote "origin"]"#;
+                continue;
+            }
+            if in_origin
+                && let Some((k, v)) = line.split_once('=')
+                && k.trim().eq_ignore_ascii_case("url")
+            {
+                return parse_remote_url(v.trim());
+            }
+        }
+        None
+    }
+}
+
+/// Parse SSH (`git@host:owner/repo.git`, `ssh://...`) or HTTP(S) git remote URLs.
+fn parse_remote_url(url: &str) -> Option<Remote> {
+    let (host_part, path_part) = if let Some(rest) =
+        url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).or_else(|| url.strip_prefix("ssh://"))
+    {
+        let (h, p) = rest.split_once('/')?;
+        let h = h.rsplit_once('@').map_or(h, |(_, h)| h);
+        let h = h.split_once(':').map_or(h, |(h, _)| h);
+        (h, p)
+    } else {
+        let rest = url.rsplit_once('@').map_or(url, |(_, r)| r);
+        rest.split_once(':')?
+    };
+    let path = path_part.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.rsplit_once('/')?;
+    if host_part.is_empty() || owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(Remote { host: host_part.to_owned(), owner: owner.to_owned(), name: name.to_owned() })
 }
 
 pub fn status(cwd: &Path, cache: &mut Cache) -> Option<Status> {
@@ -192,6 +242,7 @@ pub fn status(cwd: &Path, cache: &mut Cache) -> Option<Status> {
         default_branch: tracking.default_branch,
         upstream: tracking.upstream,
         diff,
+        remote: repo.origin_remote(),
     })
 }
 
@@ -213,4 +264,20 @@ pub fn refresh_diff(cwd: &Path) {
             .unwrap_or(0)
     };
     Cache::put_diff(&repo.top, &branch, Diff { added: count("insertion"), removed: count("deletion"), took });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_urls() {
+        let gh = |owner: &str, name: &str| Remote { host: "github.com".into(), owner: owner.into(), name: name.into() };
+        assert_eq!(parse_remote_url("git@github.com:etrippler/claude-statusline.git"), Some(gh("etrippler", "claude-statusline")));
+        assert_eq!(parse_remote_url("https://github.com/etrippler/claude-statusline.git"), Some(gh("etrippler", "claude-statusline")));
+        assert_eq!(parse_remote_url("https://user@github.com/etrippler/claude-statusline"), Some(gh("etrippler", "claude-statusline")));
+        assert_eq!(parse_remote_url("ssh://git@github.com:22/etrippler/claude-statusline.git"), Some(gh("etrippler", "claude-statusline")));
+        assert_eq!(parse_remote_url("git@gitlab.com:org/sub/repo.git"), Some(Remote { host: "gitlab.com".into(), owner: "org/sub".into(), name: "repo".into() }));
+        assert_eq!(parse_remote_url("/local/path/repo"), None);
+    }
 }

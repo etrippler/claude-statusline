@@ -5,21 +5,22 @@ use crate::{
     ansi::{BOLD, blue, bold_cyan, cyan, dim, green, justify, link, magenta, red, white, yellow},
     ci,
     fmt::{clock, cost, tokens},
-    git::{self, Status},
+    git::{self, Remote, Status},
     model::Effort,
     now,
     settings::{Settings, Toggle, Toggles},
     store::Cache,
 };
 use serde::Deserialize;
-use std::{env, path::PathBuf};
+use std::{collections::HashMap, env, path::PathBuf};
 
-/// The slice of Claude Code's statusline JSON we read. Nulls and empty strings
-/// are pruned before this sees them, so absent-or-empty is always the default.
+/// The slice of Claude Code / Antigravity's statusline JSON we read. Nulls and
+/// empty strings are pruned before this sees them, so absent-or-empty is always
+/// the default.
 #[derive(Deserialize, Default)]
 #[serde(default)]
 pub struct Input {
-    session_id: Option<String>,
+    product: Option<String>,
     workspace: Workspace,
     model: Model,
     effort: Level,
@@ -28,7 +29,9 @@ pub struct Input {
     cost: Cost,
     prompt_cache: PromptCache,
     rate_limits: RateLimits,
+    quota: HashMap<String, QuotaBucket>,
     version: Option<String>,
+    terminal_width: Option<usize>,
     pr: Url,
 }
 
@@ -37,15 +40,7 @@ pub struct Input {
 struct Workspace {
     current_dir: Option<PathBuf>,
     project_dir: Option<PathBuf>,
-    repo: Option<Repo>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(default)]
-struct Repo {
-    host: String,
-    owner: String,
-    name: String,
+    repo: Option<Remote>,
 }
 
 #[derive(Deserialize, Default)]
@@ -53,6 +48,8 @@ struct Repo {
 struct Model {
     id: String,
     display_name: Option<String>,
+    /// Antigravity nests effort inside `model`.
+    effort: Option<Effort>,
 }
 
 #[derive(Deserialize, Default)]
@@ -77,8 +74,21 @@ struct Url {
 #[serde(default)]
 struct ContextWindow {
     context_window_size: Option<f64>,
-    current_usage: Usage,
+    current_usage: CurrentUsage,
     used_percentage: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CurrentUsage {
+    Tokens(f64),
+    Breakdown(Usage),
+}
+
+impl Default for CurrentUsage {
+    fn default() -> Self {
+        Self::Tokens(0.0)
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -92,7 +102,10 @@ struct Usage {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Cost {
-    total_cost_usd: f64,
+    total_cost_usd: Option<f64>,
+    /// Antigravity pay-as-you-go / estimated spend fields.
+    total_usd: Option<f64>,
+    estimated: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -118,13 +131,27 @@ struct Window {
     resets_at: Option<f64>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct QuotaBucket {
+    remaining_fraction: Option<f64>,
+    reset_in_seconds: Option<f64>,
+    disabled: bool,
+}
+
 pub fn render(input: &Input, on: &Toggles) -> String {
+    let is_agy = input.product.as_deref() == Some("antigravity");
     let ws = &input.workspace;
     let cwd = ws.current_dir.clone().unwrap_or_else(|| env::current_dir().unwrap_or_default());
     let project = ws.project_dir.as_ref().unwrap_or(&cwd);
+    let effort = input.effort.level.as_ref().or(input.model.effort.as_ref());
     let mut cache = Cache::load();
     let git = git::status(&cwd, &mut cache);
-    let repo = ws.repo.as_ref().filter(|r| !r.host.is_empty() && !r.owner.is_empty());
+    let repo = ws
+        .repo
+        .as_ref()
+        .filter(|r| !r.host.is_empty() && !r.owner.is_empty() && !r.name.is_empty())
+        .or_else(|| git.as_ref().and_then(|g| g.remote.as_ref()));
 
     let left = git
         .as_ref()
@@ -145,9 +172,11 @@ pub fn render(input: &Input, on: &Toggles) -> String {
     cache.commit();
 
     if on.on(Toggle::Model) {
-        let name = input.model.display_name.as_deref().unwrap_or("Claude");
+        let fallback = if is_agy { "Antigravity" } else { "Claude" };
+        let name = input.model.display_name.as_deref().unwrap_or(fallback);
         let name = name.strip_prefix("Claude ").unwrap_or(name).replace(" context)", ")");
-        let mut s = match &input.effort.level {
+        let name = if effort.is_some() { strip_effort_suffix(&name) } else { name.as_str() };
+        let mut s = match effort {
             Some(e) => blue(format_args!("{name} {BOLD}{}", e.letter())),
             None => blue(name),
         };
@@ -170,15 +199,17 @@ pub fn render(input: &Input, on: &Toggles) -> String {
     if on.on(Toggle::Context) && used > 0.0 {
         // soft limit (autocompact) in white, hard limit dimmed
         let k = |n: f64| (n / 1000.0).round();
-        let at = Settings::load(project).autocompact_at(&input.model.id, window);
+        let at = (!is_agy).then(|| Settings::load(project).autocompact_at(&input.model.id, window)).flatten();
         let mut s = white(format_args!("{:.1}/{}", used / 1000.0, k(at.unwrap_or(window))));
         if at.is_some() {
             s += &dim(format_args!("/{}", k(window)));
         }
         parts.push(s);
     }
-    if on.on(Toggle::Cost) {
-        parts.push(green(cost(input.cost.total_cost_usd)));
+    if on.on(Toggle::Cost)
+        && let Some(usd) = input.cost.usd().or_else(|| (!is_agy).then_some(0.0))
+    {
+        parts.push(green(cost(usd)));
     }
 
     let sep = format!(" {} ", dim("|"));
@@ -187,7 +218,7 @@ pub fn render(input: &Input, on: &Toggles) -> String {
     // cells narrower than COLUMNS; overshooting gets the tail truncated to "…".
     let meta: Vec<String> = [
         (Toggle::Cache, prompt_cache(&input.prompt_cache)),
-        (Toggle::Limits, limits(&input.rate_limits)),
+        (Toggle::Limits, limits(&input.rate_limits, &input.quota, &input.model.id)),
         (Toggle::Version, input.version.as_ref().map(|v| dim(format_args!("v{v}")))),
     ]
     .into_iter()
@@ -196,8 +227,10 @@ pub fn render(input: &Input, on: &Toggles) -> String {
     if meta.is_empty() {
         return line;
     }
-    let cols = env::var("COLUMNS").ok().and_then(|c| c.parse().ok());
-    justify(&line, &meta.join(&sep), cols, 4, &sep)
+    let cols =
+        input.terminal_width.filter(|&c| c > 0).or_else(|| env::var("COLUMNS").ok().and_then(|c| c.parse().ok()));
+    let margin = if is_agy { 2 } else { 4 };
+    justify(&line, &meta.join(&sep), cols, margin, &sep)
 }
 
 /// "repo ⎇ worktree/subdir on  branch ↑1 ↓2 Δ+10/-3"
@@ -244,10 +277,26 @@ fn location(g: &Status, url: Option<&str>, on: &Toggles) -> String {
     parts.join(" ")
 }
 
-impl Usage {
+impl CurrentUsage {
     fn total(&self) -> f64 {
-        self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
+        match self {
+            Self::Tokens(n) => *n,
+            Self::Breakdown(u) => u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens,
+        }
     }
+}
+
+impl Cost {
+    fn usd(&self) -> Option<f64> {
+        self.total_cost_usd.or(self.total_usd).or(self.estimated)
+    }
+}
+
+/// "Gemini 4 Neon (Medium)" → "Gemini 4 Neon" when we're appending the bold effort letter.
+fn strip_effort_suffix(name: &str) -> &str {
+    let Some(rest) = name.strip_suffix(')') else { return name };
+    let Some((head, tail)) = rest.rsplit_once(" (") else { return name };
+    if ["low", "medium", "high", "xhigh", "max"].iter().any(|l| tail.eq_ignore_ascii_case(l)) { head } else { name }
 }
 
 /// "cache 42m" while warm; "cold ↻78k" = what the next turn re-writes.
@@ -275,8 +324,36 @@ fn prompt_cache(pc: &PromptCache) -> Option<String> {
     Some(dim("cache ") + &paint(format_args!("{}m", (left / 60.0).round().max(1.0))))
 }
 
-fn limits(rl: &RateLimits) -> Option<String> {
-    let w = rl.five_hour.as_ref().filter(|w| w.used_percentage > 0.0)?;
+fn quota_window(quota: &HashMap<String, QuotaBucket>, model_id: &str) -> Option<Window> {
+    if quota.is_empty() {
+        return None;
+    }
+    let family = if model_id.to_ascii_lowercase().contains("gemini") { "gemini" } else { "3p" };
+    let active = |b: &&QuotaBucket| !b.disabled && b.remaining_fraction.is_some();
+    let bucket = quota
+        .get(&format!("{family}-5h"))
+        .filter(active)
+        .or_else(|| quota.get(&format!("{family}-weekly")).filter(active))
+        .or_else(|| quota.iter().find(|(k, b)| k.ends_with("-5h") && active(b)).map(|(_, b)| b))
+        .or_else(|| {
+            quota
+                .values()
+                .filter(active)
+                .min_by(|a, b| a.remaining_fraction.unwrap_or(1.0).total_cmp(&b.remaining_fraction.unwrap_or(1.0)))
+        })?;
+    let rem = bucket.remaining_fraction?.clamp(0.0, 1.0);
+    let used_percentage = (1.0 - rem) * 100.0;
+    let resets_at = bucket.reset_in_seconds.filter(|&s| s > 0.0).map(|s| now() + s);
+    Some(Window { used_percentage, resets_at })
+}
+
+fn limits(rl: &RateLimits, quota: &HashMap<String, QuotaBucket>, model_id: &str) -> Option<String> {
+    let w = rl
+        .five_hour
+        .as_ref()
+        .map(|w| Window { used_percentage: w.used_percentage, resets_at: w.resets_at })
+        .or_else(|| quota_window(quota, model_id))
+        .filter(|w| w.used_percentage > 0.0)?;
     let pct = w.used_percentage;
     let paint = if pct >= 80.0 {
         red
@@ -291,4 +368,87 @@ fn limits(rl: &RateLimits) -> Option<String> {
         s += &dim(format_args!("@ {}", clock(reset)));
     }
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &str) -> Input {
+        let mut v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        crate::prune(&mut v);
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn effort_suffix_stripping() {
+        assert_eq!(strip_effort_suffix("Gemini 4 Neon (Medium)"), "Gemini 4 Neon");
+        assert_eq!(strip_effort_suffix("Gemini 4 Neon (XHigh)"), "Gemini 4 Neon");
+        assert_eq!(strip_effort_suffix("Opus 4.8 (1M)"), "Opus 4.8 (1M)");
+    }
+
+    #[test]
+    fn agy_quota_selects_active_family() {
+        let input = parse(
+            r#"{
+                "product": "antigravity",
+                "model": {"id": "Gemini 4 Neon (Medium)", "display_name": "Gemini 4 Neon (Medium)", "effort": "medium"},
+                "quota": {
+                    "3p-5h": {"remaining_fraction": 0.5, "reset_in_seconds": 3600},
+                    "gemini-5h": {"remaining_fraction": 0.96996, "reset_in_seconds": 17745},
+                    "gemini-weekly": {"remaining_fraction": 0.97948, "reset_in_seconds": 579442}
+                }
+            }"#,
+        );
+        let w = quota_window(&input.quota, &input.model.id).unwrap();
+        assert!((w.used_percentage - 3.004).abs() < 0.01);
+        assert!(w.resets_at.is_some());
+
+        let w3p = quota_window(&input.quota, "claude-opus-4-8").unwrap();
+        assert!((w3p.used_percentage - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn agy_render_payload() {
+        let input = parse(
+            r#"{
+                "product": "antigravity",
+                "model": {"id": "Gemini 4 Neon (Medium)", "display_name": "Gemini 4 Neon (Medium)", "effort": "medium"},
+                "workspace": {"current_dir": "/tmp", "project_dir": "/tmp"},
+                "version": "1.5.13",
+                "context_window": {
+                    "context_window_size": 1048576,
+                    "used_percentage": 14.24,
+                    "current_usage": null
+                },
+                "quota": {
+                    "gemini-5h": {"remaining_fraction": 0.96996, "reset_in_seconds": 17745}
+                },
+                "terminal_width": 120
+            }"#,
+        );
+        let out = render(&input, &Toggles::default());
+        assert!(out.contains("Gemini 4 Neon \x1b[1mM"));
+        assert!(!out.contains("(Medium)"));
+        assert!(!out.contains("$0.00"));
+        assert!(out.contains("14.2%"));
+        assert!(out.contains("3%"));
+        assert!(out.contains("v1.5.13"));
+    }
+
+    #[test]
+    fn agy_numeric_usage_and_cost() {
+        let input = parse(
+            r#"{
+                "product": "antigravity",
+                "model": {"id": "Gemini 4", "display_name": "Gemini 4"},
+                "workspace": {"current_dir": "/tmp", "project_dir": "/tmp"},
+                "context_window": {"context_window_size": 1000000, "current_usage": 12500},
+                "cost": {"total_usd": 0.42}
+            }"#,
+        );
+        let out = render(&input, &Toggles::default());
+        assert!(out.contains("$0.42"));
+        assert!(out.contains("12.5/1000"));
+    }
 }

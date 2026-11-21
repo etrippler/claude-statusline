@@ -59,6 +59,7 @@ impl Toggle {
 }
 
 /// Every toggle defaults on; the file stores only the ones switched off.
+#[derive(Default)]
 pub struct Toggles(Map<String, Value>);
 
 impl Toggles {
